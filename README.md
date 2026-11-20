@@ -1,9 +1,7 @@
 # bga_compo_audio_only
 
 Renders the audio of a BMS chart into a WAV file. Drag a .bms / .bme / .bml
-file onto the exe and you get the song back as plain audio - no video, no
-notes, just the track. Handy for BGA compo entries and whenever you need the
-sound of a chart without starting a player.
+file onto the exe and you get the song back as plain audio.
 
 ## Usage
 
