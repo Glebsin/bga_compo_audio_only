@@ -1,0 +1,12 @@
+[package]
+name = "bmflat"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Rust port of bmflat.c (BMS chart parser), byte-faithful to the C original"
+
+[lib]
+name = "bmflat"
+path = "src/lib.rs"
+
+[workspace]

@@ -1,0 +1,16 @@
+[package]
+name = "bms-audio"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Rust port of bms_audio.c (BMS -> WAV renderer), byte-faithful to the C original"
+
+[lib]
+name = "bms_audio"
+path = "src/lib.rs"
+
+[dependencies]
+bmflat = { path = "../bmflat" }
+symphonia = { version = "0.5", default-features = false, features = ["ogg", "vorbis"] }
+
+[workspace]

@@ -1,0 +1,25 @@
+dev-dependencies = { trycmd = "1" }
+[package]
+name = "bga_compo_audio_only"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "`BGA_compo_audio_only` in Rust, lifted by rust-anything from its front door"
+
+[[bin]]
+name = "bga_compo_audio_only"
+path = "src/main.rs"
+
+[dependencies]
+bms-audio = { path = "../bms-audio" }
+
+# Size without performance loss: fat LTO + one codegen unit also speed the hot
+# loop up, strip drops symbol tables, abort drops the unwinding machinery (the
+# port's out-of-contract UB paths are the only places that panic).
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[workspace]
