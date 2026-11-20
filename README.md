@@ -10,9 +10,9 @@ Output goes next to the exe:
 
     Results\<chart>\<chart>_audio.wav
 
-It works from a terminal too and takes several files at once:
+It works from a terminal too:
 
-    bga_compo_audio_only chart1.bms chart2.bml
+    bga_compo_audio_only chart1.bms
 
 After a drag and drop run the console stays open, press Enter to close it.
 
