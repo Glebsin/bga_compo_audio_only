@@ -1,4 +1,4 @@
-//! BMS -> WAV renderer. See src/port.rs.
-pub mod port;
+//! BMS -> WAV renderer. See src/renderer.rs.
+pub mod renderer;
 
-pub use port::run;
+pub use renderer::run;

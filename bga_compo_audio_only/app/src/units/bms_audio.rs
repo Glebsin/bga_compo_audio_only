@@ -5,5 +5,5 @@ use std::process::ExitCode;
 use crate::cli;
 
 pub fn run(_command: &str, matches: &cli::Matches) -> ExitCode {
-    ExitCode::from(bms_audio::port::run(&matches.args))
+    ExitCode::from(bms_audio::renderer::run(&matches.args))
 }

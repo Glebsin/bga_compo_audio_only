@@ -1,4 +1,4 @@
-//! BMS chart parser. See src/port.rs.
-pub mod port;
+//! BMS chart parser. See src/parser.rs.
+pub mod parser;
 
-pub use port::{Chart, Event, Seq, Track, bm_load, bm_to_seq};
+pub use parser::{Chart, Event, Seq, Track, bm_load, bm_to_seq};

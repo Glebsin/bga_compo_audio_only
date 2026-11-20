@@ -16,7 +16,7 @@
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
 
-use bmflat::port::{
+use bmflat::parser::{
     BM_INDEX_MAX, BM_NOTE, BM_NOTE_LONG, BM_TEMPO_CHANGE, Chart, bm_load, bm_to_seq,
 };
 
@@ -824,9 +824,7 @@ fn render_to(src: &[u8], bms_dir: Option<&std::path::Path>, out_path: &std::path
 /// Render core behind `render_to`: writes the WAV header, decodes the samples,
 /// mixes and streams stereo s16 frames into `out`; returns `(status,
 /// frame_count)` — the RIFF size patch afterwards is `finalize_wav`'s job.
-/// Public (hidden from docs) for benchmarks.
-#[doc(hidden)]
-pub fn render_stream(
+fn render_stream(
     src: &[u8],
     bms_dir: Option<&std::path::Path>,
     mut out: &mut impl std::io::Write,
