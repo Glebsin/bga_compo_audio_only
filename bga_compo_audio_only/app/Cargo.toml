@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 bms-audio = { path = "../bms-audio" }
+mimalloc = "0.1"
 
 # Size without performance loss: fat LTO + one codegen unit also speed the hot
 # loop up, strip drops symbol tables, abort drops the unwinding machinery (the

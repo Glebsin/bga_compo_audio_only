@@ -12,5 +12,17 @@ path = "src/lib.rs"
 [dependencies]
 bmflat = { path = "../bmflat" }
 symphonia = { version = "0.5", default-features = false, features = ["ogg", "vorbis"] }
+# `bytemuck` (no transitive deps): lets the mixer's pack loop view the byte
+# buffer as u16/i16 so the shift+narrow vectorizes; falls back to a scalar
+# byte-pair loop if the buffer were ever misaligned.
+bytemuck = "1"
+
+[[bench]]
+name = "render"
+harness = false
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+mimalloc = "0.1"
 
 [workspace]

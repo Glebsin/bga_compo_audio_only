@@ -9,4 +9,11 @@ description = "Rust port of bmflat.c (BMS chart parser), byte-faithful to the C 
 name = "bmflat"
 path = "src/lib.rs"
 
+[[bench]]
+name = "parse"
+harness = false
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
 [workspace]

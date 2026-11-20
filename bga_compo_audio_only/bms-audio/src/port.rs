@@ -5,6 +5,12 @@
 //!   UTF-16 command line -> ANSI (CP_ACP, best-fit, surrogates become '?') ->
 //!   quote-aware split -> MinGW-style wildcard expansion (matches replace the word;
 //!   a no-match pattern made only of `?`/`*`/`.` is dropped, anything else is kept).
+//! * Deviation from the C original (user request, 2026-11-21): chart arguments are
+//!   read through the true UTF-16 path first. Drag-and-drop hands over names the
+//!   ANSI code page cannot represent — they turned into '?…' and "Cannot read";
+//!   the sample directory follows the same Unicode path. For code-page-representable
+//!   names both pipelines open identical files; wildcards and the ANSI fallback
+//!   pipeline are unchanged.
 //! * All stderr text is CRLF (C runtime text-mode translation).
 //! * Timing math, mixing, clamping and the WAV header are transcribed from the C
 //!   source with the same f32/f64 widths and operation order.
@@ -12,7 +18,7 @@
 //!   (best-effort, via `lewton`; bit-exactness with stb_vorbis is not claimed).
 //!   MP3 is not ported: a .mp3 file behaves like a missing sample (silence).
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 
 use bmflat::port::{
@@ -245,16 +251,6 @@ fn glob_word(word: &[u8]) -> Vec<Vec<u8>> {
         vec![word.to_vec()]
     }
 }
-
-fn build_argv(args: &[OsString]) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
-    for a in args {
-        let ansi = os_to_ansi(a);
-        out.extend(glob_word(&ansi));
-    }
-    out
-}
-
 // --- decoding ---
 
 fn to_stereo_44100(pcm: &[i16], ch: usize, rate: u32) -> Vec<i16> {
@@ -387,17 +383,17 @@ fn decode_wav(b: &[u8]) -> Option<Vec<i16>> {
     Some(to_stereo_44100(&samples, channels, rate))
 }
 
-fn decode_ogg(b: &[u8]) -> Option<Vec<i16>> {
+fn decode_ogg(b: Vec<u8>) -> Option<Vec<i16>> {
     use symphonia::core::codecs::CODEC_TYPE_VORBIS;
     use symphonia::core::formats::FormatOptions;
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
     use symphonia::core::probe::Hint;
 
-    let mss = MediaSourceStream::new(
-        Box::new(std::io::Cursor::new(b.to_vec())),
-        Default::default(),
-    );
+    // Owned bytes straight from read_file: MediaSourceStream wants a 'static
+    // Box<dyn MediaSource>, so a borrowed slice cannot be used — but the extra
+    // to_vec() copy (a second full-file memcpy per Ogg) is gone.
+    let mss = MediaSourceStream::new(Box::new(std::io::Cursor::new(b)), Default::default());
     let mut hint = Hint::new();
     hint.with_extension("ogg");
     let probed = symphonia::default::get_probe()
@@ -421,6 +417,11 @@ fn decode_ogg(b: &[u8]) -> Option<Vec<i16>> {
         .ok()?;
 
     let mut samples: Vec<i16> = Vec::new();
+    // One SampleBuffer reused across packets: a fresh SampleBuffer::new per packet
+    // showed up as ~2/3 of CPU time inside the OS allocator on Ogg-heavy charts.
+    // The spec is constant for a Vorbis stream; the buffer is grown only if a
+    // later packet needs more capacity. Conversion path (F32 -> i16) unchanged.
+    let mut sbuf: Option<(symphonia::core::audio::SampleBuffer<i16>, u64)> = None;
     // lewton kept a partial decode when a packet failed; match that.
     while let Ok(packet) = format.next_packet() {
         if packet.track_id() != track_id {
@@ -430,12 +431,18 @@ fn decode_ogg(b: &[u8]) -> Option<Vec<i16>> {
             Ok(buf) => {
                 // Zero-frame packets occur in the wild; SampleBuffer panics on them.
                 if buf.frames() > 0 {
-                    let mut sbuf = symphonia::core::audio::SampleBuffer::<i16>::new(
-                        buf.frames() as u64,
-                        *buf.spec(),
-                    );
-                    sbuf.copy_interleaved_ref(buf);
-                    samples.extend_from_slice(sbuf.samples());
+                    let frames = buf.frames() as u64;
+                    let cap = frames.max(8192);
+                    let grow = !matches!(&sbuf, Some((_, c)) if *c >= frames);
+                    if grow {
+                        sbuf = Some((
+                            symphonia::core::audio::SampleBuffer::<i16>::new(cap, *buf.spec()),
+                            cap,
+                        ));
+                    }
+                    let sb = &mut sbuf.as_mut().unwrap().0;
+                    sb.copy_interleaved_ref(buf);
+                    samples.extend_from_slice(sb.samples());
                 }
             }
             Err(_) => break,
@@ -447,14 +454,47 @@ fn decode_ogg(b: &[u8]) -> Option<Vec<i16>> {
     Some(to_stereo_44100(&samples, channels, rate))
 }
 
-fn decode_file(path_ansi: &[u8]) -> Option<Vec<i16>> {
-    let bytes = read_file(path_ansi)?;
+fn decode_file(bms_dir: Option<&std::path::Path>, rel_ansi: &[u8]) -> Option<Vec<i16>> {
+    let bytes = read_rel(bms_dir, rel_ansi)?;
     if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
         decode_wav(&bytes)
     } else if bytes.starts_with(b"OggS") {
-        decode_ogg(&bytes)
+        decode_ogg(bytes)
     } else {
         None
+    }
+}
+
+/// Reads a sample file: the chart directory as a true Unicode path (from the
+/// UTF-16 argv on the primary path, ANSI-decoded on the fallback) plus the
+/// sample name bytes taken from the chart text. With no directory the relative
+/// ANSI path is used, exactly as before.
+fn read_rel(bms_dir: Option<&std::path::Path>, rel_ansi: &[u8]) -> Option<Vec<u8>> {
+    match bms_dir {
+        None => read_file(rel_ansi),
+        Some(dir) => {
+            // Byte-concat semantics of the old ANSI pipeline: the directory is
+            // used verbatim (it may already end with a separator — the fallback
+            // path keeps it, a drive root like `G:\` has one too), and the
+            // relative part is appended as-is, with one separator added only
+            // when the directory does not end with one.
+            #[cfg(windows)]
+            let ends_with_sep = {
+                use std::os::windows::ffi::OsStrExt;
+                dir.as_os_str()
+                    .encode_wide()
+                    .last()
+                    .is_some_and(|c| c == '\\' as u16 || c == '/' as u16)
+            };
+            #[cfg(not(windows))]
+            let ends_with_sep = dir.as_os_str().to_string_lossy().ends_with(['\\', '/']);
+            let mut p: std::ffi::OsString = dir.into();
+            if !ends_with_sep {
+                p.push(std::ffi::OsStr::new(&std::path::MAIN_SEPARATOR.to_string()));
+            }
+            p.push(os_from_ansi(rel_ansi));
+            std::fs::read(std::path::PathBuf::from(p)).ok()
+        }
     }
 }
 
@@ -494,44 +534,105 @@ fn eprint_bytes(b: &[u8]) {
 fn mix_write(
     ns: i32,
     waves: &mut [Wave],
+    active: &mut Vec<usize>,
     i32_buf: &mut Vec<i32>,
     byte_buf: &mut Vec<u8>,
     out: &mut impl Write,
 ) -> std::io::Result<()> {
     // Reusable scratch buffers: mix_write runs once per event, and reallocating
-    // two Vecs per call showed up in the profile of long charts.
-    i32_buf.clear();
-    i32_buf.resize((ns as usize) * 2, 0);
-    for w in waves.iter_mut() {
-        if w.ptr < 0 {
-            continue;
-        }
-        let mut j: i32 = 0;
-        while j < ns && w.ptr + j < w.len {
-            let idx = ((w.ptr + j) * 2) as usize;
-            i32_buf[j as usize * 2] += w.pcm[idx] as i32;
-            i32_buf[j as usize * 2 + 1] += w.pcm[idx + 1] as i32;
-            j += 1;
+    // two Vecs per call showed up in the profile of long charts. `active` holds
+    // the indices of currently playing waves (at most once each), so the mixer
+    // no longer scans all 1296 slots per event.
+    let byte_len = (ns as usize) * 4;
+
+    // Single-wave fast path: one contributor means i32_buf[j] == pcm[j] as i32,
+    // the clamp can never bind ((i16 as i32) >> 1 ∈ [-16384, 16383]) and the
+    // mixing pass collapses into a plain halve-and-pack of the source PCM.
+    if active.len() == 1 {
+        let i = active[0];
+        let w = &mut waves[i];
+        let frames = (ns.min(w.len - w.ptr).max(0)) as usize;
+        byte_buf.clear();
+        byte_buf.resize(byte_len, 0);
+        if frames > 0 {
+            let pcm = &w.pcm[(w.ptr as usize) * 2..][..frames * 2];
+            // A u16 view of the destination turns the pack into a plain 16-bit
+            // arithmetic shift the compiler vectorizes; little-endian bytes are
+            // exactly the two bytes the C wrote per sample.
+            if let Ok(dst) = bytemuck::try_cast_slice_mut::<u8, u16>(byte_buf) {
+                for (d, &s) in dst.iter_mut().zip(pcm.iter()) {
+                    *d = (s as i32 >> 1) as u16;
+                }
+            } else {
+                let (pairs, _) = byte_buf.as_chunks_mut::<2>();
+                for (dst, &s) in pairs.iter_mut().zip(pcm.iter()) {
+                    let s = s as i32 >> 1;
+                    dst[0] = (s & 0xff) as u8;
+                    dst[1] = (s >> 8) as u8;
+                }
+            }
         }
         w.ptr += ns;
         if w.ptr >= w.len {
             w.ptr = -1;
+            active.clear();
+        }
+        return out.write_all(byte_buf);
+    }
+
+    i32_buf.clear();
+    i32_buf.resize((ns as usize) * 2, 0);
+    let mut keep = 0usize;
+    for k in 0..active.len() {
+        let i = active[k];
+        let w = &mut waves[i];
+        // Active waves always have ptr < len (the epilogue below resets to -1);
+        // the frame count is the same the while-loop produced: j < ns && ptr+j < len.
+        let frames = ns.min(w.len - w.ptr).max(0) as usize;
+        if frames > 0 {
+            let buf = &mut i32_buf[..frames * 2];
+            let pcm = &w.pcm[(w.ptr as usize) * 2..][..frames * 2];
+            // Flat zip: no per-element bounds checks, and the widening
+            // i16 -> i32 add auto-vectorizes (SSE2/AVX2).
+            for (d, &s) in buf.iter_mut().zip(pcm.iter()) {
+                *d += s as i32;
+            }
+        }
+        w.ptr += ns;
+        if w.ptr >= w.len {
+            w.ptr = -1;
+        } else {
+            active[keep] = i;
+            keep += 1;
         }
     }
+    active.truncate(keep);
     byte_buf.clear();
-    byte_buf.reserve((ns as usize) * 4);
-    for &v in i32_buf.iter() {
-        // The C code clamps with two ifs; clamp() yields the same result.
-        let s = (v >> 1).clamp(-32768, 32767);
-        byte_buf.push((s & 0xff) as u8);
-        byte_buf.push(((s >> 8) & 0xff) as u8);
+    byte_buf.resize(byte_len, 0);
+    if let Ok(dst) = bytemuck::try_cast_slice_mut::<u8, i16>(byte_buf) {
+        // Same trick as the fast path: an i16 view lets the shift + narrow
+        // compile to packed arithmetic; (i32 >> 1).clamp then cast equals the
+        // C's two-if clamp followed by the two byte stores.
+        for (d, &v) in dst.iter_mut().zip(i32_buf.iter()) {
+            *d = (v >> 1).clamp(-32768, 32767) as i16;
+        }
+    } else {
+        let (pairs, _) = byte_buf.as_chunks_mut::<2>();
+        for (dst, &v) in pairs.iter_mut().zip(i32_buf.iter()) {
+            let s = (v >> 1).clamp(-32768, 32767);
+            dst[0] = (s & 0xff) as u8;
+            dst[1] = (s >> 8) as u8;
+        }
     }
     out.write_all(byte_buf)
 }
 
 pub fn run(args: &[OsString]) -> u8 {
-    let argv = build_argv(args);
-    if argv.is_empty() {
+    // Glob-expanded ANSI words per original argument: the all-empty check and
+    // the fallback pipeline use them; the primary read goes through the true
+    // Unicode path (see below).
+    let expanded: Vec<Vec<Vec<u8>>> = args.iter().map(|a| glob_word(&os_to_ansi(a))).collect();
+    if expanded.iter().all(|w| w.is_empty()) {
         eprint_bytes(b"Drag and drop a .bms/.bme/.bml file onto this executable.\r\n");
         return 1;
     }
@@ -544,27 +645,52 @@ pub fn run(args: &[OsString]) -> u8 {
         .and_then(|exe| exe.parent().map(|dir| dir.to_path_buf()))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let mut status = 0u8;
-    for chart in &argv {
-        let Some(src) = read_file(chart) else {
-            let mut m = Vec::new();
-            m.extend_from_slice(b"Cannot read ");
-            m.extend_from_slice(chart);
-            m.extend_from_slice(b"\r\n");
-            eprint_bytes(&m);
-            status = 1;
+    for (arg, words) in args.iter().zip(&expanded) {
+        // Explorer hands the dropped file over as a UTF-16 argument, but the ANSI
+        // argv pipeline mangles every character outside the code page into '?',
+        // which turns perfectly real folders into "Cannot read". Read through the
+        // true Unicode path first; the ANSI pipeline below stays as the fallback
+        // for wildcards and odd cases. For a code-page-representable name both
+        // paths open the same file, so nothing else changes.
+        if let Ok(src) = std::fs::read(arg) {
+            let dir = std::path::Path::new(arg).parent().map(|p| p.to_path_buf());
+            let out_path = results_wav_path_os(&exe_dir, arg);
+            if render_to(&src, dir.as_deref(), &out_path) != 0 {
+                status = 1;
+            }
             continue;
-        };
-        let bms_dir: Option<Vec<u8>> = {
-            let s1 = chart.iter().rposition(|&c| c == b'/');
-            let s2 = chart.iter().rposition(|&c| c == b'\\');
-            s1.max(s2).map(|i| chart[..=i].to_vec())
-        };
-        let out_path = results_wav_path(&exe_dir, chart);
-        if render_to(&src, bms_dir.as_deref(), &out_path) != 0 {
-            status = 1;
+        }
+        for chart in words {
+            let Some(src) = read_file(chart) else {
+                let mut m = Vec::new();
+                m.extend_from_slice(b"Cannot read ");
+                m.extend_from_slice(chart);
+                m.extend_from_slice(b"\r\n");
+                eprint_bytes(&m);
+                status = 1;
+                continue;
+            };
+            let dir = {
+                let s1 = chart.iter().rposition(|&c| c == b'/');
+                let s2 = chart.iter().rposition(|&c| c == b'\\');
+                s1.max(s2).map(|i| ansi_path(&chart[..=i]))
+            };
+            let out_path = results_wav_path(&exe_dir, chart);
+            if render_to(&src, dir.as_deref(), &out_path) != 0 {
+                status = 1;
+            }
         }
     }
     status
+}
+
+/// Same layout as `results_wav_path`, built from the true Unicode argument so
+/// stems the code page cannot represent keep their real name.
+fn results_wav_path_os(exe_dir: &std::path::Path, chart: &OsStr) -> std::path::PathBuf {
+    let stem = std::path::Path::new(chart).file_stem().unwrap_or_default();
+    let mut wav_name = stem.to_os_string();
+    wav_name.push("_audio.wav");
+    exe_dir.join("Results").join(stem).join(wav_name)
 }
 
 /// Builds `<exe dir>\Results\<chart stem>\<chart stem>_audio.wav`.
@@ -624,9 +750,18 @@ fn finalize_wav(mut out: std::io::BufWriter<std::fs::File>, samples: i32) -> u8 
 
 /// Decodes every defined wav slot in parallel. Each slot is independent (the first
 /// successful extension wins per slot), so the decode order cannot change the
-/// output — byte-verified against the sequential version. The C original decodes
-/// on one thread.
-fn decode_samples(chart: &Chart, bms_dir: Option<&[u8]>) -> Vec<(usize, Option<Vec<i16>>)> {
+/// output — byte-verified against the sequential version; the consumer writes
+/// each decoded slot into waves[slot], so the result order does not matter.
+/// Slots are handed out one by one through an atomic counter: BMS sample sets mix
+/// tiny one-shots with multi-megabyte BGM stems, and the static per-thread chunking
+/// this replaces left the wall time hostage to the luckiest-possible chunk split.
+/// The C original decodes on one thread.
+fn decode_samples(
+    chart: &Chart,
+    bms_dir: Option<&std::path::Path>,
+) -> Vec<(usize, Option<Vec<i16>>)> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     let exts: [&[u8]; 6] = [b".ogg", b".wav", b".mp3", b".OGG", b".WAV", b".MP3"];
     let slots: Vec<usize> = (0..BM_INDEX_MAX)
         .filter(|&i| chart.wav[i].is_some())
@@ -634,35 +769,40 @@ fn decode_samples(chart: &Chart, bms_dir: Option<&[u8]>) -> Vec<(usize, Option<V
     let threads = std::thread::available_parallelism()
         .map_or(4, |n| n.get())
         .min(slots.len().max(1));
-    let per_thread = slots.len().div_ceil(threads).max(1);
+    let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
-        slots
-            .chunks(per_thread)
-            .map(|chunk| {
+        (0..threads)
+            .map(|_| {
+                let slots = &slots;
+                let next = &next;
                 let exts = &exts;
                 scope.spawn(move || {
-                    chunk
-                        .iter()
-                        .filter_map(|&i| {
-                            let full = chart.wav[i].as_deref()?;
-                            let dot = full.iter().rposition(|&c| c == b'.');
-                            let base = dot.map_or(full, |d| &full[..d]);
-                            let mut p = Vec::new();
-                            if let Some(d) = bms_dir {
-                                p.extend_from_slice(d);
+                    let mut out: Vec<(usize, Option<Vec<i16>>)> = Vec::new();
+                    loop {
+                        let k = next.fetch_add(1, Ordering::Relaxed);
+                        if k >= slots.len() {
+                            break;
+                        }
+                        let i = slots[k];
+                        let Some(full) = chart.wav[i].as_deref() else {
+                            continue; // slots is pre-filtered; unreachable
+                        };
+                        let dot = full.iter().rposition(|&c| c == b'.');
+                        let base = dot.map_or(full, |d| &full[..d]);
+                        let mut rel = base.to_vec();
+                        let stem_len = rel.len();
+                        let mut pcm = None;
+                        for e in exts {
+                            rel.truncate(stem_len);
+                            rel.extend_from_slice(e);
+                            if let Some(x) = decode_file(bms_dir, &rel) {
+                                pcm = Some(x);
+                                break;
                             }
-                            p.extend_from_slice(base);
-                            let stem_len = p.len();
-                            for e in exts {
-                                p.truncate(stem_len);
-                                p.extend_from_slice(e);
-                                if let Some(pcm) = decode_file(&p) {
-                                    return Some((i, Some(pcm)));
-                                }
-                            }
-                            Some((i, None))
-                        })
-                        .collect::<Vec<_>>()
+                        }
+                        out.push((i, pcm));
+                    }
+                    out
                 })
             })
             .collect::<Vec<_>>()
@@ -682,7 +822,7 @@ fn fail_create(out_path: &std::path::Path) -> u8 {
     1
 }
 
-fn render_to(src: &[u8], bms_dir: Option<&[u8]>, out_path: &std::path::Path) -> u8 {
+fn render_to(src: &[u8], bms_dir: Option<&std::path::Path>, out_path: &std::path::Path) -> u8 {
     if let Some(dir) = out_path.parent()
         && std::fs::create_dir_all(dir).is_err()
     {
@@ -693,8 +833,34 @@ fn render_to(src: &[u8], bms_dir: Option<&[u8]>, out_path: &std::path::Path) -> 
         Err(_) => return fail_create(out_path),
     };
     let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
+    let (status, samples) = render_stream(src, bms_dir, &mut out);
+    if status != 0 {
+        return 1;
+    }
+    if finalize_wav(out, samples) != 0 {
+        return 1;
+    }
 
-    let header = |out: &mut std::io::BufWriter<std::fs::File>| -> std::io::Result<()> {
+    let mut m = Vec::new();
+    m.extend_from_slice(b"Created: ");
+    m.extend_from_slice(out_path.to_string_lossy().as_bytes());
+    m.extend_from_slice(b"\r\n");
+    eprint_bytes(&m);
+    0
+}
+
+/// Render core, split from `render_to` so benchmarks can drive the whole
+/// pipeline against an in-memory sink (no per-iteration disk writes). Writes the
+/// WAV header, decodes the samples, mixes and streams stereo s16 frames into
+/// `out`; returns `(status, frame_count)` — the RIFF size patch afterwards is
+/// still `finalize_wav`'s job.
+#[doc(hidden)]
+pub fn render_stream(
+    src: &[u8],
+    bms_dir: Option<&std::path::Path>,
+    mut out: &mut impl std::io::Write,
+) -> (u8, i32) {
+    fn header(out: &mut impl std::io::Write) -> std::io::Result<()> {
         out.write_all(b"RIFF")?;
         write_u32(out, 0)?;
         out.write_all(b"WAVEfmt ")?;
@@ -708,9 +874,9 @@ fn render_to(src: &[u8], bms_dir: Option<&[u8]>, out_path: &std::path::Path) -> 
         out.write_all(b"data")?;
         write_u32(out, 0)?;
         Ok(())
-    };
-    if header(&mut out).is_err() {
-        return 1;
+    }
+    if header(out).is_err() {
+        return (1, 0);
     }
 
     // Parse diagnostics ("Line N: ..." logs) are deliberately not printed: the user
@@ -719,6 +885,7 @@ fn render_to(src: &[u8], bms_dir: Option<&[u8]>, out_path: &std::path::Path) -> 
     let chart = bm_load(src);
 
     let mut waves: Vec<Wave> = (0..BM_INDEX_MAX).map(|_| Wave::default()).collect();
+    let mut active: Vec<usize> = Vec::new();
     let mut i32_buf: Vec<i32> = Vec::new();
     let mut byte_buf: Vec<u8> = Vec::new();
 
@@ -747,8 +914,17 @@ fn render_to(src: &[u8], bms_dir: Option<&[u8]>, out_path: &std::path::Path) -> 
         let ns = cvt_int_i32(time * 44100.0f64 - 1e-6).wrapping_sub(samples);
 
         if ns > 0 {
-            if mix_write(ns, &mut waves, &mut i32_buf, &mut byte_buf, &mut out).is_err() {
-                return 1;
+            if mix_write(
+                ns,
+                &mut waves,
+                &mut active,
+                &mut i32_buf,
+                &mut byte_buf,
+                &mut out,
+            )
+            .is_err()
+            {
+                return (1, 0);
             }
             samples = samples.wrapping_add(ns);
         }
@@ -760,19 +936,20 @@ fn render_to(src: &[u8], bms_dir: Option<&[u8]>, out_path: &std::path::Path) -> 
             && (ev.value() as usize) < BM_INDEX_MAX
             && waves[ev.value() as usize].present
         {
-            waves[ev.value() as usize].ptr = 0;
+            // Retriggering an already-playing wave restarts it (ptr = 0) without
+            // duplicating its entry in the active list.
+            let idx = ev.value() as usize;
+            if waves[idx].ptr < 0 {
+                active.push(idx);
+            }
+            waves[idx].ptr = 0;
         }
     }
 
     loop {
-        let mut active = false;
-        for w in waves.iter() {
-            if w.ptr >= 0 {
-                active = true;
-                break;
-            }
-        }
-        if !active {
+        // The active list empties exactly when every wave's ptr is negative —
+        // the same condition the per-iteration scan over all 1296 waves tested.
+        if active.is_empty() {
             break;
         }
         time += 1.0f64 / 30.0f64;
@@ -780,20 +957,20 @@ fn render_to(src: &[u8], bms_dir: Option<&[u8]>, out_path: &std::path::Path) -> 
         if ns <= 0 {
             continue;
         }
-        if mix_write(ns, &mut waves, &mut i32_buf, &mut byte_buf, &mut out).is_err() {
-            return 1;
+        if mix_write(
+            ns,
+            &mut waves,
+            &mut active,
+            &mut i32_buf,
+            &mut byte_buf,
+            &mut out,
+        )
+        .is_err()
+        {
+            return (1, 0);
         }
         samples = samples.wrapping_add(ns);
     }
 
-    if finalize_wav(out, samples) != 0 {
-        return 1;
-    }
-
-    let mut m = Vec::new();
-    m.extend_from_slice(b"Created: ");
-    m.extend_from_slice(out_path.to_string_lossy().as_bytes());
-    m.extend_from_slice(b"\r\n");
-    eprint_bytes(&m);
-    0
+    (0, samples)
 }
