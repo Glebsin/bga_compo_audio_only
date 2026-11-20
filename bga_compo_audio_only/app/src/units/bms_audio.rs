@@ -1,5 +1,4 @@
-//! Glue from the front door to `bms-audio`: parse the arguments, call `bms_audio::port`,
-//! print what the original prints and return its exit code. Every case is answered in Rust.
+//! Glue from the front door to `bms-audio`: run the renderer, return its exit code.
 
 use std::process::ExitCode;
 

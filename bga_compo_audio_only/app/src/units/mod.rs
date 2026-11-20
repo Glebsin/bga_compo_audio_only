@@ -1,4 +1,4 @@
-//! Written by `rust-anything app lift`: every command is answered in Rust.
+//! Command dispatch.
 
 use std::process::ExitCode;
 

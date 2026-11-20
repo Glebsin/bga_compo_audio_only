@@ -1,9 +1,4 @@
-//! Parses argv into a command and its arguments.
-//!
-//! Replaces the clap front door after the lift: the generated command was a single
-//! root command with one trailing-var-arg OsString argument — no flags, no
-//! subcommands, no validation, and a parse path that could not fail — so collecting
-//! `argv[1..]` verbatim is exactly what clap did.
+//! Parses argv into the root command and its trailing arguments.
 
 use std::ffi::OsString;
 

@@ -36,8 +36,7 @@ fn lcg(seed: u64) -> impl FnMut() -> usize {
     }
 }
 
-/// 1 s stereo s16 44100 WAV: decaying sine plus noise (the shape of the
-/// `bench/s01.wav..s16.wav` profiling samples).
+/// 1 s stereo s16 44100 WAV: decaying sine plus noise.
 fn wav_bytes(freq: f64, seed: u64) -> Vec<u8> {
     let frames = SR;
     let mut data = Vec::with_capacity(frames * 4);
@@ -169,7 +168,7 @@ fn bench_render_wav(c: &mut Criterion) {
     let dir = fixture_dir();
     let chart = gen_chart(120);
     let mut group = c.benchmark_group("bms_audio");
-    // 120 bars at ~170 BPM ≈ 169 s of audio ≈ 29.8 MB of PCM.
+    // ≈ 169 s of audio ≈ 29.8 MB of PCM.
     bench_dir_chart(&mut group, "wav_120bars", chart, dir, 29_800_000);
     group.finish();
 }
@@ -184,7 +183,7 @@ fn bench_render_jola(c: &mut Criterion) {
     };
     let mut group = c.benchmark_group("bms_audio");
     group.sample_size(10);
-    // JoLa_HARDEST renders 5 242 019 stereo frames ≈ 20.9 MB of PCM.
+    // ≈ 20.9 MB of PCM.
     bench_dir_chart(&mut group, "jola_real", chart, &dir, 20_968_076);
     group.finish();
 }

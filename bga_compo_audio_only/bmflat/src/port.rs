@@ -1,37 +1,23 @@
-//! Faithful Rust port of bmflat.c (Ayuu's bmflat, Mulan PSL v2).
+//! BMS chart parser.
 //!
-//! Behavior parity notes (each mirrors the C source):
-//! * `bm_load` strdups the source: everything after the first NUL byte is ignored.
-//! * ctype functions: `char` is signed on Windows; bytes >= 0x80 go through ucrt's
-//!   out-of-range path and are never space/digit/base36.
-//! * The line scanner mutates the buffer (writes NULs) exactly like the C code,
-//!   including the `end`/`line_len = -1` quirks for lines made entirely of spaces.
-//! * `strtof`/`strtol` are re-implemented C-compatibly (whitespace skip, sign, hex
-//!   floats, inf/nan). UCRT errno semantics probed against the linked ucrtbase:
-//!   a failed conversion returns 0 with errno unchanged (EINVAL is only set for an
-//!   invalid base), so bmflat's `errno != EINVAL` guard always passes and the range
-//!   check decides.
+//! Behavior notes:
+//! * `bm_load` ignores everything after the first NUL byte in the source.
+//! * ctype helpers use signed-char semantics: bytes >= 0x80 are never
+//!   space/digit/base36.
+//! * The line scanner mutates the buffer (writes NULs), including the
+//!   `end`/`line_len = -1` quirks for lines made entirely of spaces.
+//! * `strtof`/`strtol` re-implementations: a failed conversion yields ±0.0/0,
+//!   which lies outside every call-site range, so the range check decides.
 //! * Track 03 values are reinterpreted base36-as-base16.
-//! * Meta fields the renderer never reads (everything except `init_tempo`) are not
-//!   stored at all: PLAYER/RANK/TOTAL/etc. parse work is skipped entirely, the WAV
-//!   output is unaffected. Same for `bm_event.track`, the union's high half
-//!   (`value_a`) and the `#BMPxx` table (`Chart.bmp`) — never read downstream,
-//!   never written.
-//! * Parse diagnostics ("Line N: ...") are not collected: nothing in the project
-//!   reads them, and skipping the message formatting removes per-warning
-//!   allocations. Parse behavior is unchanged — every branch's side effects stay.
-//! * Sorts use the same epsilon comparators AND the same algorithm: bmflat.c calls C
-//!   `qsort`, the binary links the UCRT implementation, and qsort is not stable — which
-//!   note of a tie survives sort_track's duplicate collapse (and therefore long-note
-//!   conversion and wave triggers) depends on qsort's exact permutation. The port
-//!   transcribes the UCRT algorithm (Windows SDK 10.0.26100, ucrt/stdlib/qsort.cpp:
-//!   selection sort up to 8 elements, median-of-three quicksort above) element for
-//!   element and uses it for both the note and the event sort.
-//! * `struct bm_event` is a C union in the original: writing `value_f` clobbers
-//!   `value`/`value_a` bits. Modeled here with a raw 32-bit `bits` field.
-//!   `bm_to_seq` reuses one event struct across add_event() calls, so stale fields
-//!   leak between events exactly like in C (this is observable: long-note events
-//!   trigger their wave via a stale `value` at the long-note start position).
+//! * Meta fields the renderer never reads (everything except `init_tempo`) are
+//!   not stored, and parse diagnostics are not collected; the WAV output is
+//!   unaffected.
+//! * Sorts are epsilon-comparator based and NOT stable: the duplicate collapse
+//!   keeps the last element of each tie group, so the exact sort permutation is
+//!   part of the output contract (see the qsort section below).
+//! * `Event` is a union: writing `value_f` clobbers the `value` bits, and stale
+//!   fields leak between events (long-note events trigger their wave via a
+//!   stale `value` at the long-note start position).
 
 pub const BM_INDEX_MAX: usize = 1296;
 pub const BM_BARS_COUNT: usize = 1000;
@@ -80,9 +66,8 @@ pub struct Chart {
 pub struct Event {
     pub pos: i32,
     pub etype: u8,
-    /// C union { struct { short value; short value_a; }; float value_f; }
-    /// little-endian: value = low 16 bits; only the low half and `value_f` are
-    /// ever read downstream, so the port does not model the high half.
+    /// Union of { value: i16 } and { value_f: f32 } (little-endian); only the
+    /// low half and `value_f` are ever read.
     pub bits: u32,
 }
 
@@ -110,7 +95,7 @@ pub struct Seq {
     pub events: Vec<Event>,
 }
 
-// --- C ctype helpers (signed-char semantics: bytes >= 0x80 are out of range) ---
+// --- ctype helpers (signed-char semantics: bytes >= 0x80 are out of range) ---
 
 #[inline]
 fn is_space_or_linebreak(b: u8) -> bool {
@@ -147,7 +132,7 @@ fn base36(c1: u8, c2: u8) -> i32 {
     d(c1) * 36 + d(c2)
 }
 
-// --- C strtof / strtol ---
+// --- strtof / strtol ---
 
 fn starts_ci(b: &[u8], word: &[u8]) -> bool {
     b.len() >= word.len()
@@ -156,11 +141,8 @@ fn starts_ci(b: &[u8], word: &[u8]) -> bool {
             .all(|(x, w)| (x | 0x20) == (*w | 0x20))
 }
 
-/// C strtof: the value 0 with errno unchanged when nothing parses (the UCRT sets
-/// EINVAL only for an invalid base, never for a failed conversion — probed against
-/// the linked ucrtbase). 0 is always outside bmflat's [0.25, 63.75] / [1, 999] ranges,
-/// so None and Some(±0.0) are indistinguishable at every call site; the port mirrors
-/// the C return value anyway.
+/// Nothing parsed → ±0.0, which lies outside every call-site range, so the
+/// range check decides.
 fn c_strtof(b: &[u8]) -> Option<f32> {
     let mut i = 0usize;
     while i < b.len() && isspace_c(b[i]) {
@@ -174,8 +156,6 @@ fn c_strtof(b: &[u8]) -> Option<f32> {
     }
     // inf / infinity
     if starts_ci(&b[j..], b"inf") {
-        // C also consumes "inity" (j += 5); j is dead past this branch, so the
-        // port skips the scan — the returned value is the same INFINITY.
         return Some(if neg {
             f32::NEG_INFINITY
         } else {
@@ -184,8 +164,6 @@ fn c_strtof(b: &[u8]) -> Option<f32> {
     }
     // nan / nan(chars)
     if starts_ci(&b[j..], b"nan") {
-        // C scans the optional (n-char-seq) and advances j; j is dead past this
-        // branch, so the port skips the scan — the returned value is the same NAN.
         return Some(f32::NAN);
     }
     // hexadecimal float: 0x hexdigits [. hexdigits] [p exp]
@@ -243,7 +221,6 @@ fn c_strtof(b: &[u8]) -> Option<f32> {
             return Some(v as f32);
         }
         // No hex digits: "0x..." parses the leading "0" as a decimal number.
-        // Fall through with only the sign + "0" consumed.
         return Some(if neg { -0.0 } else { 0.0 });
     }
     // decimal
@@ -266,7 +243,7 @@ fn c_strtof(b: &[u8]) -> Option<f32> {
         }
     }
     if int_digits + frac_digits == 0 {
-        // UCRT strtof: no conversion → ±0.0, errno unchanged (not EINVAL).
+        // No conversion → ±0.0.
         return Some(if neg { -0.0 } else { 0.0 });
     }
     let mut exp: i64 = 0;
@@ -304,11 +281,8 @@ fn c_strtof(b: &[u8]) -> Option<f32> {
     Some(v)
 }
 
-/// C strtol base 10: 0 when nothing parses (UCRT leaves errno unchanged for a
-/// valid base — probed against the linked ucrtbase — so bmflat's `errno != EINVAL`
-/// check passes and the range check decides). Overflow saturates (ERANGE); the
-/// port saturates at i64 while the 32-bit `long` saturates at i32, but every
-/// bmflat range check tops out at 32767, so the verdicts coincide.
+/// Nothing parsed → 0; overflow saturates. Every range check tops out at
+/// 32767, so the saturation width does not change any verdict.
 fn c_strtol(b: &[u8]) -> Option<i64> {
     let mut i = 0usize;
     while i < b.len() && isspace_c(b[i]) {
@@ -330,7 +304,7 @@ fn c_strtol(b: &[u8]) -> Option<i64> {
 }
 
 pub fn bm_load(_source: &[u8]) -> Chart {
-    // strdup(_source): everything after the first NUL is gone.
+    // Everything after the first NUL byte is ignored.
     let end0 = _source
         .iter()
         .position(|&b| b == 0)
@@ -355,9 +329,8 @@ pub fn bm_load(_source: &[u8]) -> Chart {
         stop_track: Track::default(),
     };
 
-    // Flat stand-in for `bool track_appeared[1000][60]`: the C code indexes it with
-    // track values up to 462 (channel ZZ), wrapping past the row just like C's
-    // row-major layout does for in-array offsets. Size absorbs every in-bounds write.
+    // Sized 1000*60 + 463: track values up to 462 (channel ZZ) index past the
+    // row; the size absorbs every in-bounds write.
     let mut track_appeared = vec![false; BM_BARS_COUNT * 60 + 463];
     let mut bg_index = vec![0usize; BM_BARS_COUNT];
     let mut lnobj: i32 = -1;
@@ -384,7 +357,6 @@ pub fn bm_load(_source: &[u8]) -> Chart {
         source[end as usize] = 0;
 
         if source[ptr] != b'#' {
-            // for-update
             ptr = {
                 next += 1;
                 next
@@ -418,15 +390,14 @@ pub fn bm_load(_source: &[u8]) -> Chart {
                 arg += 1;
             }
             let token_end = arg;
-            // s[arg++] = '\0' (the byte is the space separator or the terminator)
+            // the separator/terminator byte is consumed
             let after_token = arg + 1;
             let mut arg2 = after_token;
             while arg2 < ll && isspace_c(s[arg2]) {
                 arg2 += 1;
             }
             if arg2 >= ll {
-                // Command requires non-empty arguments: skip the line (the C
-                // inlines the for-update before the continue).
+                // Command requires non-empty arguments: skip the line.
                 ptr = {
                     next += 1;
                     next
@@ -438,7 +409,6 @@ pub fn bm_load(_source: &[u8]) -> Chart {
             apply_command(&mut chart, &mut lnobj, token, value);
         }
 
-        // for-update: ptr = ++next
         ptr = {
             next += 1;
             next
@@ -498,7 +468,7 @@ pub fn bm_load(_source: &[u8]) -> Chart {
         }
     }
 
-    // Default tempo (the C emits "did not appear" logs; the assignment stays).
+    // Default tempo when #BPM never appeared.
     if chart.init_tempo == -1.0 {
         chart.init_tempo = 130.0;
     }
@@ -543,7 +513,7 @@ fn handle_track_data(
     } else if track == 1 {
         let idx = bg_index[bar];
         if idx == BM_BGM_TRACKS {
-            // Too many background tracks: the C skips the line entirely.
+            // More than 64 background tracks in one bar: skip the line.
         } else {
             if chart.background.len() <= idx {
                 chart.background.resize_with(idx + 1, Track::default);
@@ -554,11 +524,10 @@ fn handle_track_data(
     }
 }
 
-/// One command line (`#TOKEN args...`): the whole if/else chain of the C source.
+/// One command line (`#TOKEN args...`).
 fn apply_command(chart: &mut Chart, lnobj: &mut i32, token: &[u8], value: &[u8]) {
-    // The display-only commands (PLAYER/GENRE/TITLE/ARTIST/SUBARTIST/PLAYLEVEL/
-    // RANK/TOTAL/DIFFICULTY/STAGEFILE/BANNER/BACKBMP) are not stored — nothing
-    // downstream reads them — so their branches are dropped entirely.
+    // Display-only commands (PLAYER/RANK/TOTAL/STAGEFILE/...) are not stored:
+    // nothing downstream reads them.
     if token == b"BPM" {
         checked_parse_float(&mut chart.init_tempo, 1.0, 999.0, value);
     } else if token.len() >= 5 && &token[..3] == b"WAV" && isbase36(token[3]) && isbase36(token[4])
@@ -596,9 +565,7 @@ fn parse_track(s: &[u8], track: &mut Track, bar: usize) {
     let n = s.len();
     let mut p = 0usize;
     let mut i = 0i32;
-    // C: for (int p = 0, q, i = 0; s[p] != '\0'; p = q + 1)
     loop {
-        // p is at or past a valid position; loop condition s[p] != '\0'
         if p >= n {
             break;
         }
@@ -613,7 +580,7 @@ fn parse_track(s: &[u8], track: &mut Track, bar: usize) {
             q += 1;
         }
         if q >= n {
-            // Extraneous trailing character: the C stops parsing the line.
+            // Extraneous trailing character: stop parsing the line.
             break;
         }
         if !isbase36(s[p]) || !isbase36(s[q]) {
@@ -637,7 +604,6 @@ fn parse_track(s: &[u8], track: &mut Track, bar: usize) {
 }
 
 fn sort_track(track: &mut Track, max_bars: &mut i32) {
-    // C: qsort(track->notes, note_count, sizeof(struct bm_note), note_time_compare)
     ucrt_qsort(&mut track.notes, &mut |lhs: &Note, rhs: &Note| {
         let diff = ((lhs.bar as i32 - rhs.bar as i32) as f32) + (lhs.beat - rhs.beat);
         let diff = diff as f64;
@@ -779,7 +745,6 @@ pub fn bm_to_seq(chart: &Chart) -> Seq {
         }
     }
 
-    // C: qsort(seq->events, event_count, sizeof(struct bm_event), event_pos_type_compare)
     ucrt_qsort(&mut seq.events, &mut |lhs: &Event, rhs: &Event| {
         let diff = lhs.pos - rhs.pos;
         if diff == 0 {
@@ -792,22 +757,18 @@ pub fn bm_to_seq(chart: &Chart) -> Seq {
     seq
 }
 
-// --- UCRT qsort (faithful transcription) ---
+// --- qsort ---
 //
-// The C original is not stable, and bmflat.c's duplicate collapse keeps the LAST
-// element of each tie group, so which note of a tie survives depends on qsort's
-// exact permutation. This is a line-for-line transcription of the algorithm the
-// binary links (Windows SDK 10.0.26100, ucrt/stdlib/qsort.cpp): element swaps,
-// shortsort (selection sort) for runs of <= 8 elements, median-of-three quicksort
-// with the same partition loops and the same smaller-side-first recursion/stack
-// discipline. Element width does not affect the permutation: swaps move whole
-// elements and every comparison order is preserved.
+// The sort is not stable, and sort_track's duplicate collapse keeps the LAST
+// element of each tie group, so the exact permutation is part of the output:
+// selection sort for runs of <= 8 elements, median-of-three quicksort above,
+// smaller side recursed first. Do not replace it with a stable sort.
 
 const UCRT_CUTOFF: usize = 8;
 const UCRT_STKSIZ: usize = 8 * std::mem::size_of::<usize>() - 2;
 
-/// UCRT `shortsort`: selects the maximum of the remaining run (strictly greater,
-/// so the earliest maximum wins a tie) and swaps it into the tail position.
+/// Selects the maximum of the remaining run (strictly greater, so the earliest
+/// maximum wins a tie) and swaps it into the tail position.
 fn ucrt_shortsort<T>(v: &mut [T], lo: usize, mut hi: usize, comp: &mut impl FnMut(&T, &T) -> i32) {
     while hi > lo {
         let mut max = lo;
@@ -823,7 +784,7 @@ fn ucrt_shortsort<T>(v: &mut [T], lo: usize, mut hi: usize, comp: &mut impl FnMu
     }
 }
 
-/// UCRT `qsort` over a slice; `comp` follows the C contract (-1 / 0 / +1).
+/// Sorts a slice; `comp` returns -1 / 0 / +1.
 fn ucrt_qsort<T>(v: &mut [T], comp: &mut impl FnMut(&T, &T) -> i32) {
     let n = v.len();
     if n < 2 {
@@ -904,10 +865,8 @@ fn ucrt_qsort<T>(v: &mut [T], comp: &mut impl FnMut(&T, &T) -> i32) {
                 }
             }
 
-            // Sort the smaller sub-array first, push the bigger one. The C
-            // differences are signed ptrdiff_t: loguy may end one past hi, making
-            // `hi - loguy` == -1 (real charts hit this); usize arithmetic would
-            // underflow where the C comparison is perfectly normal.
+            // Sort the smaller sub-array first, push the bigger one; loguy may
+            // end one past hi, so the side sizes are compared as signed.
             if (higuy as isize - lo as isize) >= (hi as isize - loguy as isize) {
                 if lo < higuy {
                     lostk[stkptr as usize] = lo;

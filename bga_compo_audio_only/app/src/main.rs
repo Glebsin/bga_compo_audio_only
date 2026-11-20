@@ -4,9 +4,7 @@ mod units;
 use std::ffi::OsString;
 use std::process::ExitCode;
 
-// The renderer's Ogg-heavy workload spent ~2/3 of its CPU inside the OS heap
-// (decode/mix churn thousands of medium allocations). A drop-in faster global
-// allocator removes that share; program output is unaffected.
+// Faster global allocator; program output is unaffected.
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

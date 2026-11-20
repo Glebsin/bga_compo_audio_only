@@ -1,22 +1,17 @@
-//! Faithful Rust port of bms_audio.c (the BMS -> WAV renderer).
+//! BMS -> WAV renderer.
 //!
-//! Behavior parity notes:
-//! * argv goes through the same pipeline the C runtime applies on Windows:
-//!   UTF-16 command line -> ANSI (CP_ACP, best-fit, surrogates become '?') ->
-//!   quote-aware split -> MinGW-style wildcard expansion (matches replace the word;
-//!   a no-match pattern made only of `?`/`*`/`.` is dropped, anything else is kept).
-//! * Deviation from the C original (user request, 2026-11-21): chart arguments are
-//!   read through the true UTF-16 path first. Drag-and-drop hands over names the
-//!   ANSI code page cannot represent — they turned into '?…' and "Cannot read";
-//!   the sample directory follows the same Unicode path. For code-page-representable
-//!   names both pipelines open identical files; wildcards and the ANSI fallback
-//!   pipeline are unchanged.
-//! * All stderr text is CRLF (C runtime text-mode translation).
-//! * Timing math, mixing, clamping and the WAV header are transcribed from the C
-//!   source with the same f32/f64 widths and operation order.
-//! * Decoding: WAV (PCM/float, byte-exact for PCM s16 stereo 44100) and Ogg Vorbis
-//!   (best-effort, via `lewton`; bit-exactness with stb_vorbis is not claimed).
-//!   MP3 is not ported: a .mp3 file behaves like a missing sample (silence).
+//! Behavior notes:
+//! * argv: UTF-16 command line -> ANSI (CP_ACP, best-fit) -> quote-aware split ->
+//!   wildcard expansion (a no-match pattern made only of `?`/`*`/`.` is dropped,
+//!   anything else is kept). Chart arguments are first read through the true
+//!   UTF-16 path — drag-and-drop passes names the code page cannot represent —
+//!   and fall back to the ANSI pipeline for wildcards and odd cases.
+//! * All stderr text is CRLF.
+//! * Timing math, mixing, clamping and the WAV header rely on exact f32/f64
+//!   operation order — do not reorder.
+//! * Decoding: WAV (PCM/float, byte-exact for PCM s16 stereo 44100) and Ogg
+//!   Vorbis (best-effort, decoder differences are tolerated). MP3 behaves like
+//!   a missing sample (silence).
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
@@ -43,7 +38,7 @@ impl Default for Wave {
     }
 }
 
-// --- Windows ANSI plumbing (same conversions the C runtime does) ---
+// --- Windows ANSI plumbing ---
 
 #[cfg(windows)]
 mod win32 {
@@ -159,7 +154,7 @@ fn read_file(b: &[u8]) -> Option<Vec<u8>> {
     std::fs::read(ansi_path(b)).ok()
 }
 
-// --- MinGW CRT-style wildcard expansion ---
+// --- wildcard expansion ---
 
 fn has_wildcard(b: &[u8]) -> bool {
     b.iter().any(|&c| c == b'?' || c == b'*' || c == b'[')
@@ -211,7 +206,7 @@ fn fnmatch(pat: &[u8], name: &[u8]) -> bool {
     inner(pat, name)
 }
 
-/// Expands one argv word like the MinGW CRT does. Returns the words that replace it.
+/// Expands one argv word; returns the words that replace it.
 fn glob_word(word: &[u8]) -> Vec<Vec<u8>> {
     if !has_wildcard(word) {
         return vec![word.to_vec()];
@@ -390,9 +385,8 @@ fn decode_ogg(b: Vec<u8>) -> Option<Vec<i16>> {
     use symphonia::core::meta::MetadataOptions;
     use symphonia::core::probe::Hint;
 
-    // Owned bytes straight from read_file: MediaSourceStream wants a 'static
-    // Box<dyn MediaSource>, so a borrowed slice cannot be used — but the extra
-    // to_vec() copy (a second full-file memcpy per Ogg) is gone.
+    // MediaSourceStream requires a 'static Box<dyn MediaSource>, so the file
+    // bytes are moved in.
     let mss = MediaSourceStream::new(Box::new(std::io::Cursor::new(b)), Default::default());
     let mut hint = Hint::new();
     hint.with_extension("ogg");
@@ -417,12 +411,10 @@ fn decode_ogg(b: Vec<u8>) -> Option<Vec<i16>> {
         .ok()?;
 
     let mut samples: Vec<i16> = Vec::new();
-    // One SampleBuffer reused across packets: a fresh SampleBuffer::new per packet
-    // showed up as ~2/3 of CPU time inside the OS allocator on Ogg-heavy charts.
-    // The spec is constant for a Vorbis stream; the buffer is grown only if a
-    // later packet needs more capacity. Conversion path (F32 -> i16) unchanged.
+    // One SampleBuffer reused across packets (the spec is constant for a Vorbis
+    // stream); grown only when a later packet needs more capacity.
     let mut sbuf: Option<(symphonia::core::audio::SampleBuffer<i16>, u64)> = None;
-    // lewton kept a partial decode when a packet failed; match that.
+    // On a decode error keep what was decoded so far and stop.
     while let Ok(packet) = format.next_packet() {
         if packet.track_id() != track_id {
             continue;
@@ -465,19 +457,17 @@ fn decode_file(bms_dir: Option<&std::path::Path>, rel_ansi: &[u8]) -> Option<Vec
     }
 }
 
-/// Reads a sample file: the chart directory as a true Unicode path (from the
-/// UTF-16 argv on the primary path, ANSI-decoded on the fallback) plus the
-/// sample name bytes taken from the chart text. With no directory the relative
-/// ANSI path is used, exactly as before.
+/// Reads a sample file: the chart directory as a true Unicode path plus the
+/// sample name bytes taken from the chart text; with no directory — the
+/// relative ANSI path.
 fn read_rel(bms_dir: Option<&std::path::Path>, rel_ansi: &[u8]) -> Option<Vec<u8>> {
     match bms_dir {
         None => read_file(rel_ansi),
         Some(dir) => {
-            // Byte-concat semantics of the old ANSI pipeline: the directory is
-            // used verbatim (it may already end with a separator — the fallback
-            // path keeps it, a drive root like `G:\` has one too), and the
-            // relative part is appended as-is, with one separator added only
-            // when the directory does not end with one.
+            // The directory is used verbatim (the fallback path and drive roots
+            // like `G:\` end with a separator); the relative part is appended,
+            // with one separator added only when the directory does not end
+            // with one.
             #[cfg(windows)]
             let ends_with_sep = {
                 use std::os::windows::ffi::OsStrExt;
@@ -500,11 +490,8 @@ fn read_rel(bms_dir: Option<&std::path::Path>, rel_ansi: &[u8]) -> Option<Vec<u8
 
 // --- rendering ---
 
-/// x86-64 `cvttsd2si` semantics — what the original binary's `(int)` casts produce on
-/// this platform: truncation toward zero for in-range values, and `i32::MIN`
-/// (0x80000000) for NaN, infinities and out-of-range values. C leaves out-of-range
-/// `(int)` conversions undefined; the SSE conversion of the actual binary is
-/// deterministic, so the port reproduces it instead of Rust's saturating cast.
+/// Truncating cast with x86-64 `cvttsd2si` semantics: out-of-range and NaN map
+/// to `i32::MIN` instead of Rust's saturating cast.
 fn cvt_int_i32(x: f64) -> i32 {
     if (-2147483648.0..=2147483647.0).contains(&x) {
         x as i32
@@ -539,15 +526,12 @@ fn mix_write(
     byte_buf: &mut Vec<u8>,
     out: &mut impl Write,
 ) -> std::io::Result<()> {
-    // Reusable scratch buffers: mix_write runs once per event, and reallocating
-    // two Vecs per call showed up in the profile of long charts. `active` holds
-    // the indices of currently playing waves (at most once each), so the mixer
-    // no longer scans all 1296 slots per event.
+    // Reusable scratch buffers. `active` holds the indices of currently playing
+    // waves, at most one entry each.
     let byte_len = (ns as usize) * 4;
 
-    // Single-wave fast path: one contributor means i32_buf[j] == pcm[j] as i32,
-    // the clamp can never bind ((i16 as i32) >> 1 ∈ [-16384, 16383]) and the
-    // mixing pass collapses into a plain halve-and-pack of the source PCM.
+    // Single contributor: i32_buf[j] == pcm[j] as i32, so the clamp can never
+    // bind ((i16 as i32) >> 1 ∈ [-16384, 16383]) — plain halve-and-pack.
     if active.len() == 1 {
         let i = active[0];
         let w = &mut waves[i];
@@ -556,9 +540,8 @@ fn mix_write(
         byte_buf.resize(byte_len, 0);
         if frames > 0 {
             let pcm = &w.pcm[(w.ptr as usize) * 2..][..frames * 2];
-            // A u16 view of the destination turns the pack into a plain 16-bit
-            // arithmetic shift the compiler vectorizes; little-endian bytes are
-            // exactly the two bytes the C wrote per sample.
+            // A u16 view turns the pack into a 16-bit arithmetic shift that
+            // vectorizes; little-endian bytes match the two stored bytes per sample.
             if let Ok(dst) = bytemuck::try_cast_slice_mut::<u8, u16>(byte_buf) {
                 for (d, &s) in dst.iter_mut().zip(pcm.iter()) {
                     *d = (s as i32 >> 1) as u16;
@@ -586,14 +569,12 @@ fn mix_write(
     for k in 0..active.len() {
         let i = active[k];
         let w = &mut waves[i];
-        // Active waves always have ptr < len (the epilogue below resets to -1);
-        // the frame count is the same the while-loop produced: j < ns && ptr+j < len.
+        // Active waves always have ptr < len (the epilogue below resets to -1).
         let frames = ns.min(w.len - w.ptr).max(0) as usize;
         if frames > 0 {
             let buf = &mut i32_buf[..frames * 2];
             let pcm = &w.pcm[(w.ptr as usize) * 2..][..frames * 2];
-            // Flat zip: no per-element bounds checks, and the widening
-            // i16 -> i32 add auto-vectorizes (SSE2/AVX2).
+            // Flat zip: no bounds checks; the widening i16 -> i32 add vectorizes.
             for (d, &s) in buf.iter_mut().zip(pcm.iter()) {
                 *d += s as i32;
             }
@@ -610,9 +591,8 @@ fn mix_write(
     byte_buf.clear();
     byte_buf.resize(byte_len, 0);
     if let Ok(dst) = bytemuck::try_cast_slice_mut::<u8, i16>(byte_buf) {
-        // Same trick as the fast path: an i16 view lets the shift + narrow
-        // compile to packed arithmetic; (i32 >> 1).clamp then cast equals the
-        // C's two-if clamp followed by the two byte stores.
+        // i16 view: shift + narrow compile to packed arithmetic, matching clamp
+        // followed by the two byte stores.
         for (d, &v) in dst.iter_mut().zip(i32_buf.iter()) {
             *d = (v >> 1).clamp(-32768, 32767) as i16;
         }
@@ -637,21 +617,16 @@ pub fn run(args: &[OsString]) -> u8 {
         return 1;
     }
     // The Results folder lives next to the executable, not next to the chart:
-    // <exe dir>\Results\<chart stem>\<chart stem>_audio.wav. The exe dir stays a
-    // Unicode PathBuf (it can contain characters outside the ANSI code page), only
-    // the chart stem comes from the ANSI argv bytes, via ansi_to_wide.
+    // <exe dir>\Results\<chart stem>\<chart stem>_audio.wav.
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.to_path_buf()))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let mut status = 0u8;
     for (arg, words) in args.iter().zip(&expanded) {
-        // Explorer hands the dropped file over as a UTF-16 argument, but the ANSI
-        // argv pipeline mangles every character outside the code page into '?',
-        // which turns perfectly real folders into "Cannot read". Read through the
-        // true Unicode path first; the ANSI pipeline below stays as the fallback
-        // for wildcards and odd cases. For a code-page-representable name both
-        // paths open the same file, so nothing else changes.
+        // Drag-and-drop passes UTF-16 names the ANSI code page cannot represent
+        // (they mangle into '?'); read the true Unicode path first and keep the
+        // ANSI pipeline as the fallback for wildcards and odd cases.
         if let Ok(src) = std::fs::read(arg) {
             let dir = std::path::Path::new(arg).parent().map(|p| p.to_path_buf());
             let out_path = results_wav_path_os(&exe_dir, arg);
@@ -713,8 +688,7 @@ fn results_wav_path(exe_dir: &std::path::Path, chart: &[u8]) -> std::path::PathB
     out
 }
 
-/// ANSI argv bytes → OsString without further loss (the bytes are already what the
-/// C runtime would have seen); the folder part of the path stays Unicode.
+/// ANSI bytes → OsString via the code page.
 #[cfg(windows)]
 fn os_from_ansi(b: &[u8]) -> std::ffi::OsString {
     use std::os::windows::ffi::OsStringExt;
@@ -748,14 +722,12 @@ fn finalize_wav(mut out: std::io::BufWriter<std::fs::File>, samples: i32) -> u8 
     0
 }
 
-/// Decodes every defined wav slot in parallel. Each slot is independent (the first
-/// successful extension wins per slot), so the decode order cannot change the
-/// output — byte-verified against the sequential version; the consumer writes
-/// each decoded slot into waves[slot], so the result order does not matter.
-/// Slots are handed out one by one through an atomic counter: BMS sample sets mix
-/// tiny one-shots with multi-megabyte BGM stems, and the static per-thread chunking
-/// this replaces left the wall time hostage to the luckiest-possible chunk split.
-/// The C original decodes on one thread.
+/// Decodes every defined wav slot in parallel. Each slot is independent (the
+/// first successful extension wins per slot) and the consumer writes results by
+/// slot index, so the decode order cannot change the output. Slots are handed
+/// out one by one through an atomic counter: BMS sample sets mix tiny one-shots
+/// with multi-megabyte BGM stems, and static per-thread chunks would leave the
+/// wall time hostage to the chunk split.
 fn decode_samples(
     chart: &Chart,
     bms_dir: Option<&std::path::Path>,
@@ -849,11 +821,10 @@ fn render_to(src: &[u8], bms_dir: Option<&std::path::Path>, out_path: &std::path
     0
 }
 
-/// Render core, split from `render_to` so benchmarks can drive the whole
-/// pipeline against an in-memory sink (no per-iteration disk writes). Writes the
-/// WAV header, decodes the samples, mixes and streams stereo s16 frames into
-/// `out`; returns `(status, frame_count)` — the RIFF size patch afterwards is
-/// still `finalize_wav`'s job.
+/// Render core behind `render_to`: writes the WAV header, decodes the samples,
+/// mixes and streams stereo s16 frames into `out`; returns `(status,
+/// frame_count)` — the RIFF size patch afterwards is `finalize_wav`'s job.
+/// Public (hidden from docs) for benchmarks.
 #[doc(hidden)]
 pub fn render_stream(
     src: &[u8],
@@ -879,9 +850,7 @@ pub fn render_stream(
         return (1, 0);
     }
 
-    // Parse diagnostics ("Line N: ..." logs) are deliberately not printed: the user
-    // asked for a silent renderer (drag a chart, get a WAV). bm_load does not even
-    // collect them anymore.
+    // Parse diagnostics are neither collected nor printed — the renderer is silent.
     let chart = bm_load(src);
 
     let mut waves: Vec<Wave> = (0..BM_INDEX_MAX).map(|_| Wave::default()).collect();
@@ -909,8 +878,7 @@ pub fn render_stream(
     for (i, ev) in seq.events.iter().enumerate() {
         let dt = ev.pos - if i > 0 { seq.events[i - 1].pos } else { 0 };
         time += (dt as f64) * (60.0f64 / 48.0f64 / tempo);
-        // C: `int ns = (int)(time * sr - 1e-6) - samples;` — the subtraction wraps
-        // in the binary when the cast saturates to i32::MIN.
+        // The subtraction wraps when the cast saturates to i32::MIN.
         let ns = cvt_int_i32(time * 44100.0f64 - 1e-6).wrapping_sub(samples);
 
         if ns > 0 {
@@ -947,8 +915,7 @@ pub fn render_stream(
     }
 
     loop {
-        // The active list empties exactly when every wave's ptr is negative —
-        // the same condition the per-iteration scan over all 1296 waves tested.
+        // The active list empties exactly when every wave's ptr is negative.
         if active.is_empty() {
             break;
         }

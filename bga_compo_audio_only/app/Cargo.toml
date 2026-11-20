@@ -14,9 +14,8 @@ path = "src/main.rs"
 bms-audio = { path = "../bms-audio" }
 mimalloc = "0.1"
 
-# Size without performance loss: fat LTO + one codegen unit also speed the hot
-# loop up, strip drops symbol tables, abort drops the unwinding machinery (the
-# port's out-of-contract UB paths are the only places that panic).
+# Fat LTO + one codegen unit speed the hot loop up; strip drops symbol tables;
+# abort drops unwinding machinery.
 [profile.release]
 lto = "fat"
 codegen-units = 1

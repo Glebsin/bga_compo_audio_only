@@ -1,8 +1,8 @@
 //! Criterion benchmarks for the parse pipeline (`bm_load` / `bm_to_seq`).
 //!
-//! The chart text is generated in code (deterministic LCG), shaped like the
-//! profiling workload in `bench/bench.bms`: dense base-36 pairs over 9 tracks,
-//! a tempo change every 20 bars. Self-contained — no fixture files needed.
+//! The chart text is generated in code (deterministic LCG): dense base-36 pairs
+//! over 9 tracks, a tempo change every 20 bars. Self-contained — no fixture
+//! files needed.
 
 use std::hint::black_box;
 
