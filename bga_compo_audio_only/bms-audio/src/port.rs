@@ -15,7 +15,9 @@
 use std::ffi::OsString;
 use std::io::Write;
 
-use bmflat::port::{BM_INDEX_MAX, BM_NOTE, BM_NOTE_LONG, BM_TEMPO_CHANGE, bm_load, bm_to_seq};
+use bmflat::port::{
+    BM_INDEX_MAX, BM_NOTE, BM_NOTE_LONG, BM_TEMPO_CHANGE, Chart, bm_load, bm_to_seq,
+};
 
 struct Wave {
     pcm: Vec<i16>, // interleaved stereo
@@ -598,27 +600,97 @@ fn os_from_ansi(b: &[u8]) -> std::ffi::OsString {
     std::ffi::OsString::from(String::from_utf8_lossy(b).into_owned())
 }
 
+/// Patches the RIFF sizes at offsets 4 and 40 after the render loop.
+fn finalize_wav(mut out: std::io::BufWriter<std::fs::File>, samples: i32) -> u8 {
+    use std::io::{Seek, SeekFrom};
+    let data_size = (samples as u32).wrapping_mul(4);
+    let _ = out.flush();
+    let mut file = match out.into_inner() {
+        Ok(f) => f,
+        Err(e) => match e.into_inner().into_inner() {
+            Ok(f) => f,
+            Err(_) => return 1,
+        },
+    };
+    if file.seek(SeekFrom::Start(4)).is_ok() {
+        let _ = write_u32(&mut file, 36u32.wrapping_add(data_size));
+    }
+    if file.seek(SeekFrom::Start(40)).is_ok() {
+        let _ = write_u32(&mut file, data_size);
+    }
+    let _ = file.flush();
+    0
+}
+
+/// Decodes every defined wav slot in parallel. Each slot is independent (the first
+/// successful extension wins per slot), so the decode order cannot change the
+/// output — byte-verified against the sequential version. The C original decodes
+/// on one thread.
+fn decode_samples(chart: &Chart, bms_dir: Option<&[u8]>) -> Vec<(usize, Option<Vec<i16>>)> {
+    let exts: [&[u8]; 6] = [b".ogg", b".wav", b".mp3", b".OGG", b".WAV", b".MP3"];
+    let slots: Vec<usize> = (0..BM_INDEX_MAX)
+        .filter(|&i| chart.wav[i].is_some())
+        .collect();
+    let threads = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(slots.len().max(1));
+    let per_thread = slots.len().div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        slots
+            .chunks(per_thread)
+            .map(|chunk| {
+                let exts = &exts;
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .filter_map(|&i| {
+                            let full = chart.wav[i].as_deref()?;
+                            let dot = full.iter().rposition(|&c| c == b'.');
+                            let base = dot.map_or(full, |d| &full[..d]);
+                            let mut p = Vec::new();
+                            if let Some(d) = bms_dir {
+                                p.extend_from_slice(d);
+                            }
+                            p.extend_from_slice(base);
+                            let stem_len = p.len();
+                            for e in exts {
+                                p.truncate(stem_len);
+                                p.extend_from_slice(e);
+                                if let Some(pcm) = decode_file(&p) {
+                                    return Some((i, Some(pcm)));
+                                }
+                            }
+                            Some((i, None))
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
+    })
+}
+
+/// Prints "Cannot create <path>" and yields exit code 1.
+fn fail_create(out_path: &std::path::Path) -> u8 {
+    let mut m = Vec::new();
+    m.extend_from_slice(b"Cannot create ");
+    m.extend_from_slice(out_path.to_string_lossy().as_bytes());
+    m.extend_from_slice(b"\r\n");
+    eprint_bytes(&m);
+    1
+}
+
 fn render_to(src: &[u8], bms_dir: Option<&[u8]>, out_path: &std::path::Path) -> u8 {
     if let Some(dir) = out_path.parent()
         && std::fs::create_dir_all(dir).is_err()
     {
-        let mut m = Vec::new();
-        m.extend_from_slice(b"Cannot create ");
-        m.extend_from_slice(out_path.to_string_lossy().as_bytes());
-        m.extend_from_slice(b"\r\n");
-        eprint_bytes(&m);
-        return 1;
+        return fail_create(out_path);
     }
     let file = match std::fs::File::create(out_path) {
         Ok(f) => f,
-        Err(_) => {
-            let mut m = Vec::new();
-            m.extend_from_slice(b"Cannot create ");
-            m.extend_from_slice(out_path.to_string_lossy().as_bytes());
-            m.extend_from_slice(b"\r\n");
-            eprint_bytes(&m);
-            return 1;
-        }
+        Err(_) => return fail_create(out_path),
     };
     let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
 
@@ -642,63 +714,15 @@ fn render_to(src: &[u8], bms_dir: Option<&[u8]>, out_path: &std::path::Path) -> 
     }
 
     // Parse diagnostics ("Line N: ..." logs) are deliberately not printed: the user
-    // asked for a silent renderer (drag a chart, get a WAV). The logs are still
-    // collected by bm_load for anyone who wants them; printing them was the C
-    // original's behavior and is preserved in the recorded case history.
-    let (chart, _logs) = bm_load(src);
+    // asked for a silent renderer (drag a chart, get a WAV). bm_load does not even
+    // collect them anymore.
+    let chart = bm_load(src);
 
     let mut waves: Vec<Wave> = (0..BM_INDEX_MAX).map(|_| Wave::default()).collect();
     let mut i32_buf: Vec<i32> = Vec::new();
     let mut byte_buf: Vec<u8> = Vec::new();
 
-    let exts: [&[u8]; 6] = [b".ogg", b".wav", b".mp3", b".OGG", b".WAV", b".MP3"];
-    // Decode in parallel: every slot is independent (the first successful extension
-    // wins per slot), so the decode order cannot change the output — byte-verified
-    // against the sequential version. The C original decodes on one thread.
-    let slots: Vec<usize> = (0..BM_INDEX_MAX)
-        .filter(|&i| chart.wav[i].is_some())
-        .collect();
-    let threads = std::thread::available_parallelism()
-        .map_or(4, |n| n.get())
-        .min(slots.len().max(1));
-    let per_thread = slots.len().div_ceil(threads).max(1);
-    let decoded: Vec<(usize, Option<Vec<i16>>)> = std::thread::scope(|scope| {
-        slots
-            .chunks(per_thread)
-            .map(|chunk| {
-                let chart = &chart;
-                let exts = &exts;
-                scope.spawn(move || {
-                    chunk
-                        .iter()
-                        .filter_map(|&i| {
-                            let name = chart.wav[i].clone()?;
-                            let mut base = name;
-                            if let Some(d) = base.iter().rposition(|&c| c == b'.') {
-                                base.truncate(d);
-                            }
-                            for e in exts {
-                                let mut p = Vec::new();
-                                if let Some(d) = bms_dir {
-                                    p.extend_from_slice(d);
-                                }
-                                p.extend_from_slice(&base);
-                                p.extend_from_slice(e);
-                                if let Some(pcm) = decode_file(&p) {
-                                    return Some((i, Some(pcm)));
-                                }
-                            }
-                            Some((i, None))
-                        })
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .flat_map(|h| h.join().unwrap())
-            .collect()
-    });
-    for (i, pcm) in decoded {
+    for (i, pcm) in decode_samples(&chart, bms_dir) {
         if let Some(pcm) = pcm {
             waves[i] = Wave {
                 len: (pcm.len() / 2) as i32,
@@ -712,11 +736,10 @@ fn render_to(src: &[u8], bms_dir: Option<&[u8]>, out_path: &std::path::Path) -> 
     let seq = bm_to_seq(&chart);
 
     let mut time: f64 = 0.0;
-    let mut tempo: f64 = chart.meta.init_tempo as f64;
+    let mut tempo: f64 = chart.init_tempo as f64;
     let mut samples: i32 = 0;
 
-    for i in 0..seq.events.len() {
-        let ev = seq.events[i];
+    for (i, ev) in seq.events.iter().enumerate() {
         let dt = ev.pos - if i > 0 { seq.events[i - 1].pos } else { 0 };
         time += (dt as f64) * (60.0f64 / 48.0f64 / tempo);
         // C: `int ns = (int)(time * sr - 1e-6) - samples;` — the subtraction wraps
@@ -763,24 +786,8 @@ fn render_to(src: &[u8], bms_dir: Option<&[u8]>, out_path: &std::path::Path) -> 
         samples = samples.wrapping_add(ns);
     }
 
-    let data_size = (samples as u32).wrapping_mul(4);
-    let _ = out.flush();
-    let mut file = match out.into_inner() {
-        Ok(f) => f,
-        Err(e) => match e.into_inner().into_inner() {
-            Ok(f) => f,
-            Err(_) => return 1,
-        },
-    };
-    {
-        use std::io::{Seek, SeekFrom};
-        if file.seek(SeekFrom::Start(4)).is_ok() {
-            let _ = write_u32(&mut file, 36u32.wrapping_add(data_size));
-        }
-        if file.seek(SeekFrom::Start(40)).is_ok() {
-            let _ = write_u32(&mut file, data_size);
-        }
-        let _ = file.flush();
+    if finalize_wav(out, samples) != 0 {
+        return 1;
     }
 
     let mut m = Vec::new();

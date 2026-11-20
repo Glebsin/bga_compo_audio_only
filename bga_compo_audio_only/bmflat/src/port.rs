@@ -7,8 +7,19 @@
 //! * The line scanner mutates the buffer (writes NULs) exactly like the C code,
 //!   including the `end`/`line_len = -1` quirks for lines made entirely of spaces.
 //! * `strtof`/`strtol` are re-implemented C-compatibly (whitespace skip, sign, hex
-//!   floats, inf/nan, EINVAL only when nothing parses).
+//!   floats, inf/nan). UCRT errno semantics probed against the linked ucrtbase:
+//!   a failed conversion returns 0 with errno unchanged (EINVAL is only set for an
+//!   invalid base), so bmflat's `errno != EINVAL` guard always passes and the range
+//!   check decides.
 //! * Track 03 values are reinterpreted base36-as-base16.
+//! * Meta fields the renderer never reads (everything except `init_tempo`) are not
+//!   stored at all: PLAYER/RANK/TOTAL/etc. parse work is skipped entirely, the WAV
+//!   output is unaffected. Same for `bm_event.track`, the union's high half
+//!   (`value_a`) and the `#BMPxx` table (`Chart.bmp`) — never read downstream,
+//!   never written.
+//! * Parse diagnostics ("Line N: ...") are not collected: nothing in the project
+//!   reads them, and skipping the message formatting removes per-warning
+//!   allocations. Parse behavior is unchanged — every branch's side effects stay.
 //! * Sorts use the same epsilon comparators AND the same algorithm: bmflat.c calls C
 //!   `qsort`, the binary links the UCRT implementation, and qsort is not stable — which
 //!   note of a tie survives sort_track's duplicate collapse (and therefore long-note
@@ -25,7 +36,6 @@
 pub const BM_INDEX_MAX: usize = 1296;
 pub const BM_BARS_COUNT: usize = 1000;
 pub const BM_BGM_TRACKS: usize = 64;
-pub const BM_MSG_LEN: usize = 128;
 
 pub const BM_BARLINE: u8 = 0;
 pub const BM_TEMPO_CHANGE: u8 = 1;
@@ -36,48 +46,6 @@ pub const BM_STOP: u8 = 5;
 pub const BM_NOTE: u8 = 6;
 pub const BM_NOTE_LONG: u8 = 7;
 pub const BM_NOTE_OFF: u8 = 8;
-
-#[derive(Clone)]
-pub struct Log {
-    pub line: i32,
-    pub message: Vec<u8>,
-}
-
-pub struct Meta {
-    pub player_num: i32,
-    pub genre: Option<Vec<u8>>,
-    pub title: Option<Vec<u8>>,
-    pub artist: Option<Vec<u8>>,
-    pub subartist: Option<Vec<u8>>,
-    pub init_tempo: f32,
-    pub play_level: i32,
-    pub judge_rank: i32,
-    pub gauge_total: i32,
-    pub difficulty: i32,
-    pub stage_file: Option<Vec<u8>>,
-    pub banner: Option<Vec<u8>>,
-    pub back_bmp: Option<Vec<u8>>,
-}
-
-impl Default for Meta {
-    fn default() -> Self {
-        Meta {
-            player_num: -1,
-            genre: None,
-            title: None,
-            artist: None,
-            subartist: None,
-            init_tempo: -1.0,
-            play_level: -1,
-            judge_rank: -1,
-            gauge_total: -1,
-            difficulty: -1,
-            stage_file: None,
-            banner: None,
-            back_bmp: None,
-        }
-    }
-}
 
 #[derive(Clone, Copy)]
 pub struct Note {
@@ -93,14 +61,12 @@ pub struct Track {
 }
 
 pub struct Chart {
-    pub meta: Meta,
+    pub init_tempo: f32,
     pub wav: Vec<Option<Vec<u8>>>,
-    pub bmp: Vec<Option<Vec<u8>>>,
     pub tempo: Vec<f32>,
     pub stop: Vec<i16>,
     pub time_sig: Vec<u8>,
     pub background: Vec<Track>,
-    pub background_count: usize,
     pub object: Vec<Track>,
     pub tempo_track: Track,
     pub bga_base: Track,
@@ -114,9 +80,9 @@ pub struct Chart {
 pub struct Event {
     pub pos: i32,
     pub etype: u8,
-    pub track: i8,
     /// C union { struct { short value; short value_a; }; float value_f; }
-    /// little-endian: value = low 16 bits, value_a = high 16 bits.
+    /// little-endian: value = low 16 bits; only the low half and `value_f` are
+    /// ever read downstream, so the port does not model the high half.
     pub bits: u32,
 }
 
@@ -126,20 +92,12 @@ impl Event {
         self.bits as u16 as i16
     }
     #[inline]
-    pub fn value_a(&self) -> i16 {
-        (self.bits >> 16) as u16 as i16
-    }
-    #[inline]
     pub fn value_f(&self) -> f32 {
         f32::from_bits(self.bits)
     }
     #[inline]
     fn set_value(&mut self, v: i16) {
         self.bits = (self.bits & 0xFFFF_0000) | (v as u16 as u32);
-    }
-    #[inline]
-    fn set_value_a(&mut self, v: i16) {
-        self.bits = (self.bits & 0x0000_FFFF) | ((v as u16 as u32) << 16);
     }
     #[inline]
     fn set_value_f(&mut self, v: f32) {
@@ -203,7 +161,7 @@ fn starts_ci(b: &[u8], word: &[u8]) -> bool {
 /// the linked ucrtbase). 0 is always outside bmflat's [0.25, 63.75] / [1, 999] ranges,
 /// so None and Some(±0.0) are indistinguishable at every call site; the port mirrors
 /// the C return value anyway.
-pub fn c_strtof(b: &[u8]) -> Option<f32> {
+fn c_strtof(b: &[u8]) -> Option<f32> {
     let mut i = 0usize;
     while i < b.len() && isspace_c(b[i]) {
         i += 1;
@@ -216,9 +174,8 @@ pub fn c_strtof(b: &[u8]) -> Option<f32> {
     }
     // inf / infinity
     if starts_ci(&b[j..], b"inf") {
-        j += 3;
-        // C also consumes "inity" (j += 5); the port never reads j past this branch.
-        let _ = starts_ci(&b[j..], b"inity");
+        // C also consumes "inity" (j += 5); j is dead past this branch, so the
+        // port skips the scan — the returned value is the same INFINITY.
         return Some(if neg {
             f32::NEG_INFINITY
         } else {
@@ -227,17 +184,8 @@ pub fn c_strtof(b: &[u8]) -> Option<f32> {
     }
     // nan / nan(chars)
     if starts_ci(&b[j..], b"nan") {
-        j += 3;
-        if j < b.len() && b[j] == b'(' {
-            let mut k = j + 1;
-            while k < b.len() && (b[k].is_ascii_alphanumeric() || b[k] == b'_') {
-                k += 1;
-            }
-            if k < b.len() && b[k] == b')' {
-                j = k + 1;
-            }
-        }
-        let _ = j; // C's j is dead past nan(n-char-seq); keep the assignment honest
+        // C scans the optional (n-char-seq) and advances j; j is dead past this
+        // branch, so the port skips the scan — the returned value is the same NAN.
         return Some(f32::NAN);
     }
     // hexadecimal float: 0x hexdigits [. hexdigits] [p exp]
@@ -290,7 +238,6 @@ pub fn c_strtof(b: &[u8]) -> Option<f32> {
                     // C advances k = m here; the port does not read k past this branch.
                 }
             }
-            let _ = j;
             let v = mant * 2f64.powi(exp - frac_bits);
             let v = if neg { -v } else { v };
             return Some(v as f32);
@@ -323,7 +270,6 @@ pub fn c_strtof(b: &[u8]) -> Option<f32> {
         return Some(if neg { -0.0 } else { 0.0 });
     }
     let mut exp: i64 = 0;
-    let mut exp_seen = false;
     if k < b.len() && (b[k] | 0x20) == b'e' {
         let mut m = k + 1;
         let mut eneg = false;
@@ -342,11 +288,9 @@ pub fn c_strtof(b: &[u8]) -> Option<f32> {
         }
         if edigits > 0 {
             exp = if eneg { -ed } else { ed };
-            exp_seen = true;
             // C advances k = m here; the port does not read k past this branch.
         }
     }
-    let _ = exp_seen;
     let mut text = String::new();
     if neg {
         text.push('-');
@@ -365,7 +309,7 @@ pub fn c_strtof(b: &[u8]) -> Option<f32> {
 /// check passes and the range check decides). Overflow saturates (ERANGE); the
 /// port saturates at i64 while the 32-bit `long` saturates at i32, but every
 /// bmflat range check tops out at 32767, so the verdicts coincide.
-pub fn c_strtol(b: &[u8]) -> Option<i64> {
+fn c_strtol(b: &[u8]) -> Option<i64> {
     let mut i = 0usize;
     while i < b.len() && isspace_c(b[i]) {
         i += 1;
@@ -385,45 +329,7 @@ pub fn c_strtol(b: &[u8]) -> Option<i64> {
     Some(sign.saturating_mul(acc))
 }
 
-// --- log helpers (messages are raw bytes, like snprintf output) ---
-
-fn push_i32(out: &mut Vec<u8>, mut v: i32) {
-    if v < 0 {
-        out.push(b'-');
-        v = v.wrapping_neg();
-    }
-    let mut tmp = [0u8; 12];
-    let mut n = 0;
-    loop {
-        tmp[n] = b'0' + (v % 10) as u8;
-        n += 1;
-        v /= 10;
-        if v == 0 {
-            break;
-        }
-    }
-    while n > 0 {
-        n -= 1;
-        out.push(tmp[n]);
-    }
-}
-
-fn push_padded(out: &mut Vec<u8>, v: i32, width: usize) {
-    let mut tmp = Vec::new();
-    push_i32(&mut tmp, v);
-    while tmp.len() < width {
-        tmp.insert(0, b'0');
-    }
-    out.extend_from_slice(&tmp);
-}
-
-fn push_str(out: &mut Vec<u8>, s: &str) {
-    out.extend_from_slice(s.as_bytes());
-}
-
-// --- bm_load ---
-
-pub fn bm_load(_source: &[u8]) -> (Chart, Vec<Log>) {
+pub fn bm_load(_source: &[u8]) -> Chart {
     // strdup(_source): everything after the first NUL is gone.
     let end0 = _source
         .iter()
@@ -433,16 +339,13 @@ pub fn bm_load(_source: &[u8]) -> (Chart, Vec<Log>) {
     source.push(0); // buf[len] = 0
     let len = end0;
 
-    let mut logs: Vec<Log> = Vec::new();
     let mut chart = Chart {
-        meta: Meta::default(),
+        init_tempo: -1.0,
         wav: (0..BM_INDEX_MAX).map(|_| None).collect(),
-        bmp: (0..BM_INDEX_MAX).map(|_| None).collect(),
         tempo: vec![-1.0; BM_INDEX_MAX],
         stop: vec![-1; BM_INDEX_MAX],
         time_sig: vec![0; BM_BARS_COUNT],
         background: Vec::new(),
-        background_count: 0,
         object: (0..60).map(|_| Track::default()).collect(),
         tempo_track: Track::default(),
         bga_base: Track::default(),
@@ -452,16 +355,15 @@ pub fn bm_load(_source: &[u8]) -> (Chart, Vec<Log>) {
         stop_track: Track::default(),
     };
 
-    let mut bg_index = vec![0usize; BM_BARS_COUNT];
     // Flat stand-in for `bool track_appeared[1000][60]`: the C code indexes it with
     // track values up to 462 (channel ZZ), wrapping past the row just like C's
     // row-major layout does for in-array offsets. Size absorbs every in-bounds write.
     let mut track_appeared = vec![false; BM_BARS_COUNT * 60 + 463];
+    let mut bg_index = vec![0usize; BM_BARS_COUNT];
     let mut lnobj: i32 = -1;
 
     let mut ptr = 0usize;
     let mut next = 0usize;
-    let mut line: i32 = 1;
 
     while ptr != len {
         // --- line body ---
@@ -487,130 +389,25 @@ pub fn bm_load(_source: &[u8]) -> (Chart, Vec<Log>) {
                 next += 1;
                 next
             };
-            line += 1;
             continue;
         }
         let s_off = ptr + 1;
         let line_len: i64 = end - ptr as i64 - 1;
 
-        let is_track_data = line_len >= 6
+        if line_len >= 6
             && isdigit_c(source[s_off])
             && isdigit_c(source[s_off + 1])
             && isdigit_c(source[s_off + 2])
             && isdigit_c(source[s_off + 3])
             && isdigit_c(source[s_off + 4])
-            && source[s_off + 5] == b':';
-
-        if is_track_data {
-            let bar = (source[s_off] as i32 * 100
-                + source[s_off + 1] as i32 * 10
-                + source[s_off + 2] as i32
-                - b'0' as i32 * 111) as usize;
-            let track = (source[s_off + 3] as i32 * 10 + source[s_off + 4] as i32
-                - b'0' as i32 * 11) as i64;
-
-            if (3..=69).contains(&track)
-                && track != 5
-                && track % 10 != 0
-                && track_appeared[bar * 60 + track as usize]
-            {
-                let mut m = Vec::new();
-                push_str(&mut m, "Track ");
-                push_padded(&mut m, track as i32, 2);
-                push_str(&mut m, " already defined previously, merging all notes");
-                logs.push(Log { line, message: m });
-            }
-            track_appeared[bar * 60 + track as usize] = true;
-
-            let value_bytes = &source[s_off + 6..end as usize];
-            if track == 2 {
-                // Time signature
-                if let Some(x) = c_strtof(value_bytes) {
-                    if (0.25..=63.75).contains(&x) {
-                        let y = (x * 4.0f32 + 0.5f32) as i32;
-                        if ((y as f32 - x * 4.0f32) as f64).abs() >= 1e-3 {
-                            let mut m = Vec::new();
-                            push_str(&mut m, "Inaccurate time signature, treating as ");
-                            push_i32(&mut m, y);
-                            push_str(&mut m, "/4");
-                            logs.push(Log { line, message: m });
-                        }
-                        if chart.time_sig[bar] != 0 {
-                            let mut m = Vec::new();
-                            push_str(&mut m, "Time signature for bar ");
-                            push_padded(&mut m, bar as i32, 3);
-                            push_str(&mut m, " defined multiple times, overwriting");
-                            logs.push(Log { line, message: m });
-                        }
-                        chart.time_sig[bar] = y as u8;
-                    } else {
-                        let mut m = Vec::new();
-                        push_str(
-                            &mut m,
-                            "Invalid time signature, should be a multiple of 0.25 between 0.25 and 63.75 (inclusive)",
-                        );
-                        logs.push(Log { line, message: m });
-                    }
-                } else {
-                    let mut m = Vec::new();
-                    push_str(
-                        &mut m,
-                        "Invalid time signature, should be a multiple of 0.25 between 0.25 and 63.75 (inclusive)",
-                    );
-                    logs.push(Log { line, message: m });
-                }
-            } else if track == 3 {
-                parse_track(line, value_bytes, &mut chart.tempo_track, bar, &mut logs);
-            } else if track == 4 {
-                parse_track(line, value_bytes, &mut chart.bga_base, bar, &mut logs);
-            } else if track == 6 {
-                parse_track(line, value_bytes, &mut chart.bga_poor, bar, &mut logs);
-            } else if track == 7 {
-                parse_track(line, value_bytes, &mut chart.bga_layer, bar, &mut logs);
-            } else if track == 8 {
-                parse_track(line, value_bytes, &mut chart.ex_tempo, bar, &mut logs);
-            } else if track == 9 {
-                parse_track(line, value_bytes, &mut chart.stop_track, bar, &mut logs);
-            } else if (10..=69).contains(&track) && track % 10 != 0 {
-                parse_track(
-                    line,
-                    value_bytes,
-                    &mut chart.object[(track - 10) as usize],
-                    bar,
-                    &mut logs,
-                );
-            } else if track == 1 {
-                if bg_index[bar] == BM_BGM_TRACKS {
-                    let mut m = Vec::new();
-                    push_str(&mut m, "Too many background tracks (more than 64) for bar ");
-                    push_padded(&mut m, bar as i32, 3);
-                    push_str(&mut m, ", ignoring");
-                    logs.push(Log { line, message: m });
-                } else {
-                    let idx = bg_index[bar];
-                    if chart.background.len() <= idx {
-                        chart.background.resize_with(idx + 1, Track::default);
-                    }
-                    parse_track(
-                        line,
-                        value_bytes,
-                        &mut chart.background[idx],
-                        bar,
-                        &mut logs,
-                    );
-                    bg_index[bar] += 1;
-                    if chart.background_count < bg_index[bar] {
-                        chart.background_count = bg_index[bar];
-                    }
-                }
-            } else {
-                let mut m = Vec::new();
-                push_str(&mut m, "Unknown track ");
-                m.push(source[s_off + 3]);
-                m.push(source[s_off + 4]);
-                push_str(&mut m, ", ignoring");
-                logs.push(Log { line, message: m });
-            }
+            && source[s_off + 5] == b':'
+        {
+            handle_track_data(
+                &mut chart,
+                &mut track_appeared,
+                &mut bg_index,
+                &source[s_off..end as usize],
+            );
         } else {
             // --- command ---
             // line_len can be -1 (a '#' on a line of only spaces): slice defensively
@@ -628,245 +425,24 @@ pub fn bm_load(_source: &[u8]) -> (Chart, Vec<Log>) {
                 arg2 += 1;
             }
             if arg2 >= ll {
-                let mut m = Vec::new();
-                push_str(&mut m, "Command requires non-empty arguments, ignoring");
-                logs.push(Log { line, message: m });
-                // for-update
+                // Command requires non-empty arguments: skip the line (the C
+                // inlines the for-update before the continue).
                 ptr = {
                     next += 1;
                     next
                 };
-                line += 1;
                 continue;
             }
             let token = &source[s_off..s_off + token_end];
-            let value = source[s_off + arg2..end as usize].to_vec();
-
-            if token == b"PLAYER" {
-                checked_parse_int_log(
-                    &mut chart.meta.player_num,
-                    1,
-                    3,
-                    b"Multiple PLAYER commands, overwritten",
-                    line,
-                    &mut logs,
-                    &value,
-                );
-            } else if token == b"GENRE" {
-                if chart.meta.genre.is_some() {
-                    let mut m = Vec::new();
-                    push_str(&mut m, "Multiple GENRE commands, overwritten");
-                    logs.push(Log { line, message: m });
-                }
-                chart.meta.genre = Some(value.clone());
-            } else if token == b"TITLE" {
-                if chart.meta.title.is_some() {
-                    let mut m = Vec::new();
-                    push_str(&mut m, "Multiple TITLE commands, overwritten");
-                    logs.push(Log { line, message: m });
-                }
-                chart.meta.title = Some(value.clone());
-            } else if token == b"ARTIST" {
-                if chart.meta.artist.is_some() {
-                    let mut m = Vec::new();
-                    push_str(&mut m, "Multiple ARTIST commands, overwritten");
-                    logs.push(Log { line, message: m });
-                }
-                chart.meta.artist = Some(value.clone());
-            } else if token == b"SUBARTIST" {
-                if chart.meta.subartist.is_some() {
-                    let mut m = Vec::new();
-                    push_str(&mut m, "Multiple SUBARTIST commands, overwritten");
-                    logs.push(Log { line, message: m });
-                }
-                chart.meta.subartist = Some(value.clone());
-            } else if token == b"BPM" {
-                checked_parse_float(
-                    &mut chart.meta.init_tempo,
-                    1.0,
-                    999.0,
-                    Some(b"Multiple BPM commands, overwritten".to_vec()),
-                    line,
-                    &mut logs,
-                    &value,
-                );
-            } else if token == b"PLAYLEVEL" {
-                checked_parse_int_log(
-                    &mut chart.meta.play_level,
-                    1,
-                    999,
-                    b"Multiple PLAYLEVEL commands, overwritten",
-                    line,
-                    &mut logs,
-                    &value,
-                );
-            } else if token == b"RANK" {
-                checked_parse_int_log(
-                    &mut chart.meta.judge_rank,
-                    0,
-                    3,
-                    b"Multiple RANK commands, overwritten",
-                    line,
-                    &mut logs,
-                    &value,
-                );
-            } else if token == b"TOTAL" {
-                checked_parse_int_log(
-                    &mut chart.meta.gauge_total,
-                    1,
-                    9999,
-                    b"Multiple TOTAL commands, overwritten",
-                    line,
-                    &mut logs,
-                    &value,
-                );
-            } else if token == b"DIFFICULTY" {
-                checked_parse_int_log(
-                    &mut chart.meta.difficulty,
-                    1,
-                    5,
-                    b"Multiple DIFFICULTY commands, overwritten",
-                    line,
-                    &mut logs,
-                    &value,
-                );
-            } else if token == b"STAGEFILE" {
-                if chart.meta.stage_file.is_some() {
-                    let mut m = Vec::new();
-                    push_str(&mut m, "Multiple STAGEFILE commands, overwritten");
-                    logs.push(Log { line, message: m });
-                }
-                chart.meta.stage_file = Some(value.clone());
-            } else if token == b"BANNER" {
-                if chart.meta.banner.is_some() {
-                    let mut m = Vec::new();
-                    push_str(&mut m, "Multiple BANNER commands, overwritten");
-                    logs.push(Log { line, message: m });
-                }
-                chart.meta.banner = Some(value.clone());
-            } else if token == b"BACKBMP" {
-                if chart.meta.back_bmp.is_some() {
-                    let mut m = Vec::new();
-                    push_str(&mut m, "Multiple BACKBMP commands, overwritten");
-                    logs.push(Log { line, message: m });
-                }
-                chart.meta.back_bmp = Some(value.clone());
-            } else if token.len() >= 5
-                && &token[..3] == b"WAV"
-                && isbase36(token[3])
-                && isbase36(token[4])
-            {
-                let index = base36(token[3], token[4]) as usize;
-                let dup = chart.wav[index].is_some();
-                if dup {
-                    let mut m = Vec::new();
-                    push_str(&mut m, "Wave ");
-                    m.push(token[3]);
-                    m.push(token[4]);
-                    push_str(&mut m, " specified multiple times, overwritten");
-                    logs.push(Log { line, message: m });
-                }
-                chart.wav[index] = Some(value);
-            } else if token.len() >= 5
-                && &token[..3] == b"BMP"
-                && isbase36(token[3])
-                && isbase36(token[4])
-            {
-                let index = base36(token[3], token[4]) as usize;
-                let dup = chart.bmp[index].is_some();
-                if dup {
-                    let mut m = Vec::new();
-                    push_str(&mut m, "Bitmap ");
-                    m.push(token[3]);
-                    m.push(token[4]);
-                    push_str(&mut m, " specified multiple times, overwritten");
-                    logs.push(Log { line, message: m });
-                }
-                chart.bmp[index] = Some(value);
-            } else if token.len() >= 5
-                && &token[..3] == b"BPM"
-                && isbase36(token[3])
-                && isbase36(token[4])
-            {
-                let index = base36(token[3], token[4]) as usize;
-                let mut dup_msg: Option<Vec<u8>> = None;
-                if chart.tempo[index] != -1.0 {
-                    let mut m = Vec::new();
-                    push_str(&mut m, "Tempo ");
-                    m.push(token[3]);
-                    m.push(token[4]);
-                    push_str(&mut m, " specified multiple times, overwritten");
-                    dup_msg = Some(m);
-                }
-                checked_parse_float(
-                    &mut chart.tempo[index],
-                    1.0,
-                    999.0,
-                    dup_msg,
-                    line,
-                    &mut logs,
-                    &value,
-                );
-            } else if token.len() >= 6
-                && &token[..4] == b"STOP"
-                && isbase36(token[4])
-                && isbase36(token[5])
-            {
-                let index = base36(token[4], token[5]) as usize;
-                let dup = chart.stop[index] != -1;
-                if dup {
-                    let mut m = Vec::new();
-                    push_str(&mut m, "Stop ");
-                    m.push(token[4]);
-                    m.push(token[5]);
-                    push_str(&mut m, " specified multiple times, overwritten");
-                    logs.push(Log { line, message: m });
-                }
-                match c_strtol(&value) {
-                    Some(x) if (0..=32767).contains(&x) => {
-                        chart.stop[index] = x as i16;
-                    }
-                    _ => {
-                        let mut m = Vec::new();
-                        push_str(
-                            &mut m,
-                            "Invalid integral value, should be between 0 and 32767 (inclusive)",
-                        );
-                        logs.push(Log { line, message: m });
-                    }
-                }
-            } else if token == b"LNOBJ" {
-                if isbase36(value[0]) && value.len() > 1 && isbase36(value[1]) {
-                    if lnobj != -1 {
-                        let mut m = Vec::new();
-                        push_str(&mut m, "Multiple LNOBJ commands, overwritten");
-                        logs.push(Log { line, message: m });
-                    }
-                    lnobj = base36(value[0], value[1]);
-                } else {
-                    let mut m = Vec::new();
-                    push_str(&mut m, "Invalid base-36 index ");
-                    m.push(value[0]);
-                    // C reads s[arg+1] even when it is the line's NUL terminator
-                    m.push(if value.len() > 1 { value[1] } else { 0 });
-                    push_str(&mut m, ", ignoring");
-                    logs.push(Log { line, message: m });
-                }
-            } else {
-                let mut m = Vec::new();
-                push_str(&mut m, "Unrecognized command ");
-                m.extend_from_slice(token);
-                push_str(&mut m, ", ignoring");
-                logs.push(Log { line, message: m });
-            }
+            let value = &source[s_off + arg2..end as usize];
+            apply_command(&mut chart, &mut lnobj, token, value);
         }
 
-        // for-update: ptr = ++next, line++
+        // for-update: ptr = ++next
         ptr = {
             next += 1;
             next
         };
-        line += 1;
     }
 
     // --- Postprocessing ---
@@ -922,159 +498,100 @@ pub fn bm_load(_source: &[u8]) -> (Chart, Vec<Log>) {
         }
     }
 
-    // Defaults (with logs, line = -1)
-    if chart.meta.player_num == -1 {
-        chart.meta.player_num = 1;
-        let mut m = Vec::new();
-        push_str(&mut m, "Command PLAYER did not appear, defaulting to 1");
-        logs.push(Log {
-            line: -1,
-            message: m,
-        });
-    }
-    if chart.meta.genre.is_none() {
-        chart.meta.genre = Some(b"(unknown)".to_vec());
-        let mut m = Vec::new();
-        push_str(
-            &mut m,
-            "Command GENRE did not appear, defaulting to strdup(\"(unknown)\")",
-        );
-        logs.push(Log {
-            line: -1,
-            message: m,
-        });
-    }
-    if chart.meta.title.is_none() {
-        chart.meta.title = Some(b"(unknown)".to_vec());
-        let mut m = Vec::new();
-        push_str(
-            &mut m,
-            "Command TITLE did not appear, defaulting to strdup(\"(unknown)\")",
-        );
-        logs.push(Log {
-            line: -1,
-            message: m,
-        });
-    }
-    if chart.meta.artist.is_none() {
-        chart.meta.artist = Some(b"(unknown)".to_vec());
-        let mut m = Vec::new();
-        push_str(
-            &mut m,
-            "Command ARTIST did not appear, defaulting to strdup(\"(unknown)\")",
-        );
-        logs.push(Log {
-            line: -1,
-            message: m,
-        });
-    }
-    if chart.meta.subartist.is_none() {
-        chart.meta.subartist = Some(b"(unknown)".to_vec());
-    }
-    if chart.meta.init_tempo == -1.0 {
-        chart.meta.init_tempo = 130.0;
-        let mut m = Vec::new();
-        push_str(&mut m, "Command BPM did not appear, defaulting to 130");
-        logs.push(Log {
-            line: -1,
-            message: m,
-        });
-    }
-    if chart.meta.play_level == -1 {
-        chart.meta.play_level = 3;
-        let mut m = Vec::new();
-        push_str(&mut m, "Command LEVEL did not appear, defaulting to 3");
-        logs.push(Log {
-            line: -1,
-            message: m,
-        });
-    }
-    if chart.meta.judge_rank == -1 {
-        chart.meta.judge_rank = 3;
-    }
-    if chart.meta.gauge_total == -1 {
-        chart.meta.gauge_total = 160;
-    }
-    if chart.meta.stage_file.is_none() {
-        chart.meta.stage_file = Some(b"(none)".to_vec());
-    }
-    if chart.meta.banner.is_none() {
-        chart.meta.banner = Some(b"(none)".to_vec());
-    }
-    if chart.meta.back_bmp.is_none() {
-        chart.meta.back_bmp = Some(b"(none)".to_vec());
+    // Default tempo (the C emits "did not appear" logs; the assignment stays).
+    if chart.init_tempo == -1.0 {
+        chart.init_tempo = 130.0;
     }
 
-    (chart, logs)
+    chart
 }
 
-fn checked_parse_int_log(
-    var: &mut i32,
-    min: i64,
-    max: i64,
-    dup_msg: &[u8],
-    line: i32,
-    logs: &mut Vec<Log>,
-    bytes: &[u8],
+/// One `#NNNCC:...` track-data line: `s` spans the text between `#` and the line's
+/// terminator (`NNNCC:` then the value bytes).
+fn handle_track_data(
+    chart: &mut Chart,
+    track_appeared: &mut [bool],
+    bg_index: &mut [usize],
+    s: &[u8],
 ) {
-    match c_strtol(bytes) {
-        Some(x) if x >= min && x <= max => {
-            if *var != -1 {
-                let mut m = Vec::new();
-                m.extend_from_slice(dup_msg);
-                logs.push(Log { line, message: m });
-            }
-            *var = x as i32;
+    let bar = (s[0] as i32 * 100 + s[1] as i32 * 10 + s[2] as i32 - b'0' as i32 * 111) as usize;
+    let track = (s[3] as i32 * 10 + s[4] as i32 - b'0' as i32 * 11) as i64;
+    track_appeared[bar * 60 + track as usize] = true;
+
+    if track == 2 {
+        // Time signature
+        if let Some(x) = c_strtof(&s[6..])
+            && (0.25..=63.75).contains(&x)
+        {
+            let y = (x * 4.0f32 + 0.5f32) as i32;
+            chart.time_sig[bar] = y as u8;
         }
-        _ => {
-            let mut m = Vec::new();
-            push_str(&mut m, "Invalid integral value, should be between ");
-            push_i32(&mut m, min as i32);
-            push_str(&mut m, " and ");
-            push_i32(&mut m, max as i32);
-            push_str(&mut m, " (inclusive)");
-            logs.push(Log { line, message: m });
+    } else if track == 3 {
+        parse_track(&s[6..], &mut chart.tempo_track, bar);
+    } else if track == 4 {
+        parse_track(&s[6..], &mut chart.bga_base, bar);
+    } else if track == 6 {
+        parse_track(&s[6..], &mut chart.bga_poor, bar);
+    } else if track == 7 {
+        parse_track(&s[6..], &mut chart.bga_layer, bar);
+    } else if track == 8 {
+        parse_track(&s[6..], &mut chart.ex_tempo, bar);
+    } else if track == 9 {
+        parse_track(&s[6..], &mut chart.stop_track, bar);
+    } else if (10..=69).contains(&track) && track % 10 != 0 {
+        parse_track(&s[6..], &mut chart.object[(track - 10) as usize], bar);
+    } else if track == 1 {
+        let idx = bg_index[bar];
+        if idx == BM_BGM_TRACKS {
+            // Too many background tracks: the C skips the line entirely.
+        } else {
+            if chart.background.len() <= idx {
+                chart.background.resize_with(idx + 1, Track::default);
+            }
+            parse_track(&s[6..], &mut chart.background[idx], bar);
+            bg_index[bar] += 1;
         }
     }
 }
 
-fn checked_parse_float(
-    var: &mut f32,
-    min: f32,
-    max: f32,
-    dup_msg: Option<Vec<u8>>,
-    line: i32,
-    logs: &mut Vec<Log>,
-    bytes: &[u8],
-) {
-    match c_strtof(bytes) {
-        Some(x) if x >= min && x <= max => {
-            if *var != -1.0 {
-                let m = dup_msg.unwrap_or_default();
-                logs.push(Log { line, message: m });
-            }
-            *var = x;
+/// One command line (`#TOKEN args...`): the whole if/else chain of the C source.
+fn apply_command(chart: &mut Chart, lnobj: &mut i32, token: &[u8], value: &[u8]) {
+    // The display-only commands (PLAYER/GENRE/TITLE/ARTIST/SUBARTIST/PLAYLEVEL/
+    // RANK/TOTAL/DIFFICULTY/STAGEFILE/BANNER/BACKBMP) are not stored — nothing
+    // downstream reads them — so their branches are dropped entirely.
+    if token == b"BPM" {
+        checked_parse_float(&mut chart.init_tempo, 1.0, 999.0, value);
+    } else if token.len() >= 5 && &token[..3] == b"WAV" && isbase36(token[3]) && isbase36(token[4])
+    {
+        let index = base36(token[3], token[4]) as usize;
+        chart.wav[index] = Some(value.to_vec());
+    } else if token.len() >= 5 && &token[..3] == b"BPM" && isbase36(token[3]) && isbase36(token[4])
+    {
+        let index = base36(token[3], token[4]) as usize;
+        checked_parse_float(&mut chart.tempo[index], 1.0, 999.0, value);
+    } else if token.len() >= 6 && &token[..4] == b"STOP" && isbase36(token[4]) && isbase36(token[5])
+    {
+        let index = base36(token[4], token[5]) as usize;
+        if let Some(x) = c_strtol(value)
+            && (0..=32767).contains(&x)
+        {
+            chart.stop[index] = x as i16;
         }
-        _ => {
-            let mut m = Vec::new();
-            // %g of the constants 1.0 and 999.0 in the C source prints "1" and "999"
-            push_str(
-                &mut m,
-                "Invalid integral value, should be between 1 and 999 (inclusive)",
-            );
-            logs.push(Log { line, message: m });
-        }
+    } else if token == b"LNOBJ" && isbase36(value[0]) && value.len() > 1 && isbase36(value[1]) {
+        *lnobj = base36(value[0], value[1]);
     }
 }
 
-fn parse_track(line: i32, s: &[u8], track: &mut Track, bar: usize, logs: &mut Vec<Log>) {
-    let mut count = 0i32;
-    for &b in s {
-        if !isspace_c(b) {
-            count += 1;
-        }
+fn checked_parse_float(var: &mut f32, min: f32, max: f32, bytes: &[u8]) {
+    if let Some(x) = c_strtof(bytes)
+        && (min..=max).contains(&x)
+    {
+        *var = x;
     }
-    count /= 2;
+}
+
+fn parse_track(s: &[u8], track: &mut Track, bar: usize) {
+    let count = s.iter().filter(|&&b| !isspace_c(b)).count() as i32 / 2;
 
     let n = s.len();
     let mut p = 0usize;
@@ -1096,22 +613,11 @@ fn parse_track(line: i32, s: &[u8], track: &mut Track, bar: usize, logs: &mut Ve
             q += 1;
         }
         if q >= n {
-            let mut m = Vec::new();
-            push_str(&mut m, "Extraneous trailing character ");
-            m.push(s[p]);
-            push_str(&mut m, ", ignoring");
-            logs.push(Log { line, message: m });
+            // Extraneous trailing character: the C stops parsing the line.
             break;
         }
         if !isbase36(s[p]) || !isbase36(s[q]) {
-            let mut m = Vec::new();
-            push_str(&mut m, "Invalid base-36 index ");
-            m.push(s[p]);
-            m.push(s[q]);
-            push_str(&mut m, " at column ");
-            push_i32(&mut m, p as i32 + 8);
-            push_str(&mut m, ", ignoring");
-            logs.push(Log { line, message: m });
+            // Invalid base-36 index: skip the pair.
             p = q + 1;
             continue;
         }
@@ -1175,28 +681,22 @@ pub fn bm_to_seq(chart: &Chart) -> Seq {
     let mut event = Event {
         pos: 0,
         etype: 0,
-        track: 0,
         bits: 0,
     };
 
     // Bar lines
     let mut beats: i32 = 0;
-    let mut stop_at = BM_BARS_COUNT;
     for (i, start) in bar_start.iter_mut().enumerate() {
         *start = beats;
         event.pos = beats * 48;
         event.etype = BM_BARLINE;
-        event.track = 0;
         event.set_value(i as i16);
-        event.set_value_a(chart.time_sig[i] as i16);
         beats += chart.time_sig[i] as i32;
         seq.events.push(event);
         if chart.time_sig[i] == 0 {
-            stop_at = i;
             break;
         }
     }
-    let _ = stop_at;
 
     let pos_of = |note: &Note| -> i32 {
         bar_start[note.bar as usize] * 48
@@ -1207,7 +707,6 @@ pub fn bm_to_seq(chart: &Chart) -> Seq {
     for note in chart.tempo_track.notes.iter() {
         event.pos = pos_of(note);
         event.etype = BM_TEMPO_CHANGE;
-        event.track = 3;
         event.set_value_f(note.value as f32);
         seq.events.push(event);
     }
@@ -1215,7 +714,6 @@ pub fn bm_to_seq(chart: &Chart) -> Seq {
     for note in chart.ex_tempo.notes.iter() {
         event.pos = pos_of(note);
         event.etype = BM_TEMPO_CHANGE;
-        event.track = 8;
         event.set_value_f(chart.tempo[note.value as usize]);
         seq.events.push(event);
     }
@@ -1224,21 +722,18 @@ pub fn bm_to_seq(chart: &Chart) -> Seq {
     for note in chart.bga_base.notes.iter() {
         event.pos = pos_of(note);
         event.etype = BM_BGA_BASE_CHANGE;
-        event.track = 4;
         event.set_value(note.value);
         seq.events.push(event);
     }
     for note in chart.bga_layer.notes.iter() {
         event.pos = pos_of(note);
         event.etype = BM_BGA_LAYER_CHANGE;
-        event.track = 7;
         event.set_value(note.value);
         seq.events.push(event);
     }
     for note in chart.bga_poor.notes.iter() {
         event.pos = pos_of(note);
         event.etype = BM_BGA_POOR_CHANGE;
-        event.track = 6;
         event.set_value(note.value);
         seq.events.push(event);
     }
@@ -1247,17 +742,15 @@ pub fn bm_to_seq(chart: &Chart) -> Seq {
     for note in chart.stop_track.notes.iter() {
         event.pos = pos_of(note);
         event.etype = BM_STOP;
-        event.track = 9;
         event.set_value(chart.stop[note.value as usize]);
         seq.events.push(event);
     }
 
     // Backgrounds
-    for (i, track) in chart.background.iter().enumerate() {
+    for track in chart.background.iter() {
         for note in track.notes.iter() {
             event.pos = pos_of(note);
             event.etype = BM_NOTE;
-            event.track = -(i as i8);
             event.set_value(note.value);
             seq.events.push(event);
         }
@@ -1270,7 +763,6 @@ pub fn bm_to_seq(chart: &Chart) -> Seq {
                 // Release of a long note
                 event.etype = BM_NOTE_LONG;
                 let p = pos_of(note);
-                event.set_value_a(p.wrapping_sub(event.pos) as i16);
                 seq.events.push(event);
                 // Add a pair of events to simplify time-range queries
                 event.pos = p;
@@ -1278,11 +770,6 @@ pub fn bm_to_seq(chart: &Chart) -> Seq {
                 seq.events.push(event);
             } else {
                 event.pos = pos_of(note);
-                let mut tr = i as i32 + 10;
-                if tr >= 50 {
-                    tr -= 40;
-                }
-                event.track = tr as i8;
                 event.set_value(note.value);
                 if !note.hold {
                     event.etype = BM_NOTE;
