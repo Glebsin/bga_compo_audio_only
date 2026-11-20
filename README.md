@@ -5,7 +5,7 @@ file onto the exe and you get the song back as plain audio.
 
 ## Usage
 
-Drag and drop one or more chart files onto `bga_compo_audio_only.exe`.
+Drag and drop chart file onto `bga_compo_audio_only.exe`.
 Output goes next to the exe:
 
     Results\<chart>\<chart>_audio.wav
