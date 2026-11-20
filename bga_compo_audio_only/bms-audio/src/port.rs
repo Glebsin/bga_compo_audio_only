@@ -529,42 +529,92 @@ fn mix_write(
 
 pub fn run(args: &[OsString]) -> u8 {
     let argv = build_argv(args);
-    // argc includes the program name
-    if argv.len() != 1 {
-        eprint_bytes(b"Drag and drop a .bms/.bme file onto this executable.\r\n");
+    if argv.is_empty() {
+        eprint_bytes(b"Drag and drop a .bms/.bme/.bml file onto this executable.\r\n");
         return 1;
     }
-    let bms_path = argv[0].clone();
-    let src = match read_file(&bms_path) {
-        Some(v) => v,
-        None => {
+    // The Results folder lives next to the executable, not next to the chart:
+    // <exe dir>\Results\<chart stem>\<chart stem>_audio.wav. The exe dir stays a
+    // Unicode PathBuf (it can contain characters outside the ANSI code page), only
+    // the chart stem comes from the ANSI argv bytes, via ansi_to_wide.
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.to_path_buf()))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let mut status = 0u8;
+    for chart in &argv {
+        let Some(src) = read_file(chart) else {
             let mut m = Vec::new();
             m.extend_from_slice(b"Cannot read ");
-            m.extend_from_slice(&bms_path);
+            m.extend_from_slice(chart);
             m.extend_from_slice(b"\r\n");
             eprint_bytes(&m);
-            return 1;
+            status = 1;
+            continue;
+        };
+        let bms_dir: Option<Vec<u8>> = {
+            let s1 = chart.iter().rposition(|&c| c == b'/');
+            let s2 = chart.iter().rposition(|&c| c == b'\\');
+            s1.max(s2).map(|i| chart[..=i].to_vec())
+        };
+        let out_path = results_wav_path(&exe_dir, chart);
+        if render_to(&src, bms_dir.as_deref(), &out_path) != 0 {
+            status = 1;
         }
-    };
-
-    let bms_dir: Option<Vec<u8>> = {
-        let s1 = bms_path.iter().rposition(|&c| c == b'/');
-        let s2 = bms_path.iter().rposition(|&c| c == b'\\');
-        s1.max(s2).map(|i| bms_path[..=i].to_vec())
-    };
-
-    let mut out_path = bms_path.clone();
-    if let Some(i) = out_path.iter().rposition(|&c| c == b'.') {
-        out_path.truncate(i);
     }
-    out_path.extend_from_slice(b"_audio.wav");
+    status
+}
 
-    let file = match std::fs::File::create(ansi_path(&out_path)) {
+/// Builds `<exe dir>\Results\<chart stem>\<chart stem>_audio.wav`.
+fn results_wav_path(exe_dir: &std::path::Path, chart: &[u8]) -> std::path::PathBuf {
+    let last_sep = chart
+        .iter()
+        .rposition(|&c| c == b'/' || c == b'\\')
+        .map_or(0, |i| i + 1);
+    let stem_end = chart[last_sep..]
+        .iter()
+        .rposition(|&c| c == b'.')
+        .map_or(chart.len(), |dot| last_sep + dot);
+    let stem = &chart[last_sep..stem_end];
+    let mut wav_name = stem.to_vec();
+    wav_name.extend_from_slice(b"_audio.wav");
+    let mut out = exe_dir.to_path_buf();
+    out.push("Results");
+    out.push(os_from_ansi(stem));
+    out.push(os_from_ansi(&wav_name));
+    out
+}
+
+/// ANSI argv bytes → OsString without further loss (the bytes are already what the
+/// C runtime would have seen); the folder part of the path stays Unicode.
+#[cfg(windows)]
+fn os_from_ansi(b: &[u8]) -> std::ffi::OsString {
+    use std::os::windows::ffi::OsStringExt;
+    std::ffi::OsString::from_wide(&win32::ansi_to_wide(b))
+}
+
+#[cfg(not(windows))]
+fn os_from_ansi(b: &[u8]) -> std::ffi::OsString {
+    std::ffi::OsString::from(String::from_utf8_lossy(b).into_owned())
+}
+
+fn render_to(src: &[u8], bms_dir: Option<&[u8]>, out_path: &std::path::Path) -> u8 {
+    if let Some(dir) = out_path.parent()
+        && std::fs::create_dir_all(dir).is_err()
+    {
+        let mut m = Vec::new();
+        m.extend_from_slice(b"Cannot create ");
+        m.extend_from_slice(out_path.to_string_lossy().as_bytes());
+        m.extend_from_slice(b"\r\n");
+        eprint_bytes(&m);
+        return 1;
+    }
+    let file = match std::fs::File::create(out_path) {
         Ok(f) => f,
         Err(_) => {
             let mut m = Vec::new();
             m.extend_from_slice(b"Cannot create ");
-            m.extend_from_slice(&out_path);
+            m.extend_from_slice(out_path.to_string_lossy().as_bytes());
             m.extend_from_slice(b"\r\n");
             eprint_bytes(&m);
             return 1;
@@ -595,7 +645,7 @@ pub fn run(args: &[OsString]) -> u8 {
     // asked for a silent renderer (drag a chart, get a WAV). The logs are still
     // collected by bm_load for anyone who wants them; printing them was the C
     // original's behavior and is preserved in the recorded case history.
-    let (chart, _logs) = bm_load(&src);
+    let (chart, _logs) = bm_load(src);
 
     let mut waves: Vec<Wave> = (0..BM_INDEX_MAX).map(|_| Wave::default()).collect();
     let mut i32_buf: Vec<i32> = Vec::new();
@@ -617,7 +667,6 @@ pub fn run(args: &[OsString]) -> u8 {
             .chunks(per_thread)
             .map(|chunk| {
                 let chart = &chart;
-                let bms_dir = &bms_dir;
                 let exts = &exts;
                 scope.spawn(move || {
                     chunk
@@ -736,7 +785,7 @@ pub fn run(args: &[OsString]) -> u8 {
 
     let mut m = Vec::new();
     m.extend_from_slice(b"Created: ");
-    m.extend_from_slice(&out_path);
+    m.extend_from_slice(out_path.to_string_lossy().as_bytes());
     m.extend_from_slice(b"\r\n");
     eprint_bytes(&m);
     0
